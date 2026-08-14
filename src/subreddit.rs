@@ -1,18 +1,15 @@
 #![allow(clippy::cmp_owned)]
 
 use crate::utils::{
-	Post, Preferences, Subreddit, catch_random, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls, setting, template, to_absolute_url, val
+	catch_random, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls, setting, template, val, Post, Preferences,
+	Subreddit,
 };
 use crate::{client::json, server::RequestExt, server::ResponseExt};
-use crate::{config, utils};
 use askama::Template;
 use cookie::Cookie;
-use htmlescape::decode_html;
 use hyper::{Body, Request, Response};
 
-use chrono::DateTime;
 use regex::Regex;
-use rss::{ChannelBuilder, Item, Enclosure};
 use std::sync::LazyLock;
 use time::{Duration, OffsetDateTime};
 
@@ -35,6 +32,7 @@ struct SubredditTemplate {
 	/// Whether all posts were hidden because they are NSFW (and user has disabled show NSFW)
 	all_posts_hidden_nsfw: bool,
 	no_posts: bool,
+	metadata_error: bool,
 }
 
 #[derive(Template)]
@@ -44,7 +42,6 @@ struct WikiTemplate {
 	wiki: String,
 	page: String,
 	prefs: Preferences,
-	url: String,
 }
 
 #[derive(Template)]
@@ -106,13 +103,32 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	}
 
 	// Request subreddit metadata
+	let mut metadata_error = false;
 	let sub = if !sub_name.contains('+') && sub_name != subscribed && sub_name != "popular" && sub_name != "all" {
 		// Regular subreddit
-		subreddit(&sub_name, quarantined).await.unwrap_or_default()
+		match subreddit(&sub_name, quarantined).await {
+			Ok(sub) => sub,
+			Err(_) => {
+				metadata_error = true;
+				Subreddit {
+					name: sub_name.clone(),
+					..Subreddit::default()
+				}
+			}
+		}
 	} else if sub_name == subscribed {
 		// Subscription feed
 		if req.uri().path().starts_with("/r/") {
-			subreddit(&sub_name, quarantined).await.unwrap_or_default()
+			match subreddit(&sub_name, quarantined).await {
+				Ok(sub) => sub,
+				Err(_) => {
+					metadata_error = true;
+					Subreddit {
+						name: sub_name.clone(),
+						..Subreddit::default()
+					}
+				}
+			}
 		} else {
 			Subreddit::default()
 		}
@@ -159,6 +175,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
+			metadata_error,
 		}))
 	} else {
 		match Post::fetch(&path, quarantined).await {
@@ -167,8 +184,8 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				let no_posts = posts.is_empty();
 				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 				if sort == "new" {
-					posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
-					posts.sort_by(|a, b| b.flags.stickied.cmp(&a.flags.stickied));
+					posts.sort_by_key(|post| std::cmp::Reverse(post.created_ts));
+					posts.sort_by_key(|post| std::cmp::Reverse(post.flags.stickied));
 				}
 				Ok(template(&SubredditTemplate {
 					sub,
@@ -182,6 +199,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					all_posts_filtered,
 					all_posts_hidden_nsfw,
 					no_posts,
+					metadata_error,
 				}))
 			}
 			Err(msg) => match msg.as_str() {
@@ -283,47 +301,10 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 	let mut sub_list = preferences.subscriptions;
 	let mut filters = preferences.filters;
 
-	// Retrieve list of posts for these subreddits to extract display names
-
-	let posts = json(format!("/r/{sub}/hot.json?raw_json=1"), true).await;
-	let display_lookup: Vec<(String, &str)> = match &posts {
-		Ok(posts) => posts["data"]["children"]
-			.as_array()
-			.map(|list| {
-				list
-					.iter()
-					.map(|post| {
-						let display_name = post["data"]["subreddit"].as_str().unwrap_or_default();
-						(display_name.to_lowercase(), display_name)
-					})
-					.collect::<Vec<_>>()
-			})
-			.unwrap_or_default(),
-		Err(_) => vec![],
-	};
-
 	// Find each subreddit name (separated by '+') in sub parameter
 	for part in sub.split('+').filter(|x| x != &"") {
-		// Retrieve display name for the subreddit
-		let display;
-		let part = if part.starts_with("u_") {
-			part
-		} else if let Some(&(_, display)) = display_lookup.iter().find(|x| x.0 == part.to_lowercase()) {
-			// This is already known, doesn't require separate request
-			display
-		} else {
-			// This subreddit display name isn't known, retrieve it
-			let path: String = format!("/r/{part}/about.json?raw_json=1");
-			display = json(path, true).await;
-			match &display {
-				Ok(display) => display["data"]["display_name"].as_str(),
-				Err(_) => None,
-			}
-			.unwrap_or(part)
-		};
-
 		// Modify sub list based on action
-		if action.contains(&"subscribe".to_string()) && !sub_list.contains(&part.to_owned()) {
+		if action.contains(&"subscribe".to_string()) && !sub_list.iter().any(|item| item.eq_ignore_ascii_case(part)) {
 			// Add each sub name to the subscribed list
 			sub_list.push(part.to_owned());
 			filters.retain(|s| s.to_lowercase() != part.to_lowercase());
@@ -333,7 +314,7 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 		} else if action.contains(&"unsubscribe".to_string()) {
 			// Remove sub name from subscribed list
 			sub_list.retain(|s| s.to_lowercase() != part.to_lowercase());
-		} else if action.contains(&"filter".to_string()) && !filters.contains(&part.to_owned()) {
+		} else if action.contains(&"filter".to_string()) && !filters.iter().any(|item| item.eq_ignore_ascii_case(part)) {
 			// Add each sub name to the filtered list
 			filters.push(part.to_owned());
 			sub_list.retain(|s| s.to_lowercase() != part.to_lowercase());
@@ -466,15 +447,12 @@ pub async fn wiki(req: Request<Body>) -> Result<Response<Body>, String> {
 
 	let page = req.param("page").unwrap_or_else(|| "index".to_string());
 	let path: String = format!("/r/{sub}/wiki/{page}.json?raw_json=1");
-	let url = req.uri().to_string();
-
 	match json(path, quarantined).await {
 		Ok(response) => Ok(template(&WikiTemplate {
 			sub,
 			wiki: rewrite_urls(response["data"]["content_html"].as_str().unwrap_or("<h3>Wiki not found</h3>")),
 			page,
 			prefs: Preferences::new(&req),
-			url,
 		})),
 		Err(msg) => {
 			if msg == "quarantined" || msg == "gated" {
@@ -497,8 +475,6 @@ pub async fn sidebar(req: Request<Body>) -> Result<Response<Body>, String> {
 
 	// Build the Reddit JSON API url
 	let path: String = format!("/r/{sub}/about.json?raw_json=1");
-	let url = req.uri().to_string();
-
 	// Send a request to the url
 	match json(path, quarantined).await {
 		// If success, receive JSON in response
@@ -512,7 +488,6 @@ pub async fn sidebar(req: Request<Body>) -> Result<Response<Body>, String> {
 			sub,
 			page: "Sidebar".to_string(),
 			prefs: Preferences::new(&req),
-			url,
 		})),
 		Err(msg) => {
 			if msg == "quarantined" || msg == "gated" {
@@ -586,133 +561,6 @@ async fn subreddit(sub: &str, quarantined: bool) -> Result<Subreddit, String> {
 		wiki: res["data"]["wiki_enabled"].as_bool().unwrap_or_default(),
 		nsfw: res["data"]["over18"].as_bool().unwrap_or_default(),
 	})
-}
-
-pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
-	if config::get_setting("REDLIB_ENABLE_RSS").is_none() {
-		return Ok(error(req, "RSS is disabled on this instance.").await.unwrap_or_default());
-	}
-
-	use hyper::header::CONTENT_TYPE;
-
-	// Get subreddit
-	let sub = req.param("sub").unwrap_or_default();
-	let post_sort = req.cookie("post_sort").map_or_else(|| "hot".to_string(), |c| c.value().to_string());
-	let sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
-
-	// Get path
-	let path = format!("/r/{sub}/{sort}.json?{}", req.uri().query().unwrap_or_default());
-
-	// Get subreddit link
-	let subreddit_link: String = format!("{}/r/{sub}", config::get_setting("REDLIB_FULL_URL").unwrap_or_default());
-
-	// Get subreddit data
-	let subreddit = subreddit(&sub, false).await?;
-
-	// Get posts
-	let (posts, _) = Post::fetch(&path, false).await?;
-
-	// Build the RSS feed
-	let channel = ChannelBuilder::default()
-		.title(&subreddit.title)
-		.description(&subreddit.description)
-		.link(&subreddit_link)
-		.items(
-			posts
-				.into_iter()
-				.map(|post| {
-					let mut item = Item {
-						title: Some(post.title.to_string()),
-						link: Some(format_url(&utils::get_post_url(&post))),
-						author: Some(post.author.name.to_string()),
-						content: Some(rewrite_urls(&decode_html(&post.body).unwrap())),
-						pub_date: Some(DateTime::from_timestamp(post.created_ts as i64, 0).unwrap_or_default().to_rfc2822()),
-						description: Some(format!("<a href='{}'>Comments</a>", to_absolute_url(&post.permalink))),
-						..Default::default()
-					};
-
-					apply_enclosure(&mut item, &post);
-					item
-				})
-				.collect::<Vec<_>>(),
-		)
-		.build();
-
-	// Serialize the feed to RSS
-	let body = channel.to_string().into_bytes();
-
-	// Create the HTTP response
-	let mut res = Response::new(Body::from(body));
-	res.headers_mut().insert(CONTENT_TYPE, hyper::header::HeaderValue::from_static("application/rss+xml"));
-
-	Ok(res)
-}
-
-// Set enclosure image for RSS feed item
-fn apply_enclosure(item: &mut Item, post: &Post) {
-	item.set_enclosure(get_rss_image(&post));
-
-	// Embed the number of gallery images in description and content since
-	// only the first image in the gallery is used for the enclosure
-	if post.post_type == "gallery" && post.gallery.len() > 1 {
-		item.set_description(
-			format!("<a href='{}'>Gallery with {} images</a>",
-				to_absolute_url(&post.permalink),
-				post.gallery.len()
-			)
-		);
-
-		if let Some(content) = item.content() {
-			let new_content = format!(
-				"{}<br/>{}",
-				item.description().unwrap_or(""),
-				content,
-			);
-			item.set_content(new_content);
-		}
-	}
-
-}
-
-fn get_rss_image(post: &Post) -> Option<Enclosure> {
-	let image_url = match post.post_type.as_str() {
-		"image" => Some(post.media.url.clone()),
-		"gallery" => post.gallery.get(0).and_then(|media| decode_html(&media.url).ok()),
-		"gif" | "video" => decode_html(&post.media.poster).ok(),
-		_ => None,
-	};
-
-	image_url.map(|url| {
-		let mut enclosure = Enclosure::default();
-		enclosure.set_mime_type(get_mime_type(&url));
-		enclosure.set_url(to_absolute_url(&url));
-		enclosure.set_length("0");
-		enclosure
-	})
-}
-
-/// Determines the MIME type based on file extension in a URL.
-/// Handles both absolute and relative URLs with query parameters.
-fn get_mime_type(url: &str) -> &'static str {
-    // Extract the path component, removing query parameters
-    let path = url.split('?').next().unwrap_or(url);
-    
-    // Get the file extension (everything after the last dot)
-    let extension = path
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
-    
-    // Match common image extensions
-    match extension.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        _ => "application/octet-stream",
-    }
 }
 
 #[cfg(test)]

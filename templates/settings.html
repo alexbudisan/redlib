@@ -53,7 +53,7 @@
 			<fieldset>
 				<legend>Content</legend>
 				<div class="prefs-group">
-					<label for="video_quality">Video quality:</label>
+					<label for="video_quality">Initial HLS video quality:</label>
 					<select name="video_quality" id="video_quality">
 						{% call utils::options(prefs.video_quality, ["best", "medium", "worst"], "best") %}
 					</select>
@@ -98,6 +98,39 @@
 					<input type="checkbox" name="autoplay_videos" id="autoplay_videos" {% if prefs.autoplay_videos=="on"
 						%}checked{% endif %}>
 				</div>
+				<div class="prefs-group prefs-group-help">
+					<label for="embed_comment_gifs">Embed supported GIF links in comments</label>
+					<input type="hidden" value="off" name="embed_comment_gifs">
+					<input type="checkbox" name="embed_comment_gifs" id="embed_comment_gifs" {% if
+						prefs.embed_comment_gifs=="on" %}checked{% endif %}>
+					<details id="comment_gif_help">
+						<summary>Limits and privacy</summary>
+						<div class="helper">Default off. Supports Giphy, direct Imgur GIF links, and Reddit-hosted GIF links; uses muted MP4 previews
+							where available,
+							rejects individual media over 8 MB, and observes the limits configured below. Embedded media is proxied through this
+							instance; tapping a preview visits its original source.</div>
+					</details>
+				</div>
+				<div class="prefs-group">
+					<label for="comment_gif_limit">Maximum GIF previews per page:</label>
+					<input type="number" name="comment_gif_limit" id="comment_gif_limit" value="{{ prefs.comment_gif_limit }}" min="0" max="50" step="1">
+				</div>
+				<div class="prefs-group">
+					<label for="comment_gif_total_mb">Maximum total GIF size per page (MB):</label>
+					<input type="number" name="comment_gif_total_mb" id="comment_gif_total_mb" value="{{ prefs.comment_gif_total_mb }}" min="1" max="100" step="1">
+				</div>
+				<div class="prefs-group prefs-group-help">
+					<label for="disable_gifs_on_metered">Disable comment GIF previews on reported cellular or data-saver connections</label>
+					<input type="hidden" value="off" name="disable_gifs_on_metered">
+					<input type="checkbox" name="disable_gifs_on_metered" id="disable_gifs_on_metered" {% if
+						prefs.disable_gifs_on_metered=="on" %}checked{% endif %}>
+					<details id="comment_gif_network_help">
+						<summary>Browser support</summary>
+						<div class="helper">Enabled by default. Chromium-based browsers can report metered connections.
+							Safari on iPhone and iPad does not expose whether the device is using cellular data, so this
+							cannot be detected there.</div>
+					</details>
+				</div>
 				<div class="prefs-group">
 					<label for="fixed_navbar">Keep navbar fixed</label>
 					<input type="hidden" value="off" name="fixed_navbar">
@@ -109,16 +142,15 @@
 					<input type="checkbox" name="hide_sidebar_and_summary" {% if prefs.hide_sidebar_and_summary=="on"
 						%}checked{% endif %}>
 				</div>
-				<div class="prefs-group">
-					<label for="use_hls">Use HLS for videos</label>
-					<details id="feeds">
-						<summary>Why?</summary>
-						<div id="feed_list" class="helper">Reddit videos require JavaScript (via HLS.js) to be enabled
-							to be played with audio. Therefore, this toggle lets you either use Redlib JS-free or
-							utilize this feature.</div>
-					</details>
+				<div class="prefs-group prefs-group-help">
+					<label for="use_hls">Compatible video playback with audio (uses HLS.js)</label>
 					<input type="hidden" value="off" name="use_hls">
 					<input type="checkbox" name="use_hls" id="use_hls" {% if prefs.use_hls=="on" %}checked{% endif %}>
+					<details id="hls_help">
+						<summary>Why?</summary>
+						<div id="feed_list" class="helper">Enable this for Reddit videos with audio and selectable quality.
+							Leave it off for JavaScript-free MP4 playback, which may not include audio.</div>
+					</details>
 				</div>
 				<div class="prefs-group">
 					<label for="hide_hls_notification">Hide notification about possible HLS usage</label>
@@ -138,13 +170,6 @@
 					<input type="checkbox" name="hide_score" id="hide_score" {% if prefs.hide_score=="on" %}checked{%
 						endif %}>
 				</div>
-				<div class="prefs-group">
-					<label for="disable_visit_reddit_confirmation">Do not confirm before visiting content on
-						Reddit</label>
-					<input type="hidden" value="off" name="disable_visit_reddit_confirmation">
-					<input type="checkbox" name="disable_visit_reddit_confirmation" {% if
-						prefs.disable_visit_reddit_confirmation=="on" %}checked{% endif %}>
-				</div>
 			</fieldset>
 			<input id="save" type="submit" value="Save">
 		</div>
@@ -158,29 +183,53 @@
 			{% if sub.starts_with("u_") -%}{% let feed = format!("u/{}", &sub[2..]) -%}{% else -%}{% let feed =
 			format!("r/{}", sub) -%}{% endif -%}
 			<a href="/{{ feed }}">{{ feed }}</a>
-			<form action="/r/{{ sub }}/unsubscribe/?redirect=settings" method="POST">
+			<form action="/settings/list" method="POST">
+				<input type="hidden" name="list_kind" value="subscriptions">
+				<input type="hidden" name="operation" value="remove">
+				<input type="hidden" name="value" value="{{ sub }}">
 				<button class="unsubscribe">Unsubscribe</button>
 			</form>
 		</div>
 		{% endfor %}
 	</div>
 	{% endif %}
+	<div class="prefs">
+		<legend>Add a subscribed feed</legend>
+		<form action="/settings/list" method="POST">
+			<input type="hidden" name="list_kind" value="subscriptions">
+			<input type="text" name="value" placeholder="r/community or u/user" required>
+			<button class="subscribe" type="submit">Add</button>
+		</form>
+	</div>
 	{% if !prefs.filters.is_empty() %}
 	<div class="prefs" id="settings_filters">
 		<legend>Filtered Feeds</legend>
 		{% for sub in prefs.filters %}
 		<div>
-			{% let feed -%}
-			{% if sub.starts_with("u_") -%}{% let feed = format!("u/{}", &sub[2..]) -%}{% else -%}{% let feed =
-			format!("r/{}", sub) -%}{% endif -%}
-			<a href="/{{ feed }}">{{ feed }}</a>
-			<form action="/r/{{ sub }}/unfilter/?redirect=settings" method="POST">
+			{% if sub.contains(":") %}<span>{{ sub }}</span>{% else %}
+				{% let feed -%}
+				{% if sub.starts_with("u_") -%}{% let feed = format!("u/{}", &sub[2..]) -%}{% else -%}{% let feed = format!("r/{}", sub) -%}{% endif -%}
+				<a href="/{{ feed }}">{{ feed }}</a>
+			{% endif %}
+			<form action="/settings/list" method="POST">
+				<input type="hidden" name="list_kind" value="filters">
+				<input type="hidden" name="operation" value="remove">
+				<input type="hidden" name="value" value="{{ sub }}">
 				<button class="unfilter">Unfilter</button>
 			</form>
 		</div>
 		{% endfor %}
 	</div>
 	{% endif %}
+	<div class="prefs">
+		<legend>Add a content filter</legend>
+		<p class="helper">Use a community name, u_user, domain:example.com, flair:text, author:name, type:image, or title:keyword.</p>
+		<form action="/settings/list" method="POST">
+			<input type="hidden" name="list_kind" value="filters">
+			<input type="text" name="value" placeholder="domain:example.com" required>
+			<button class="filter" type="submit">Add filter</button>
+		</form>
+	</div>
 
 	<div id="settings_note">
 		<p><b>Note:</b> settings and subscriptions are saved in browser cookies. Clearing your cookies will reset them.
@@ -211,6 +260,10 @@
 				<button class="import" type="submit">Import</button>
 			</form>
 		</div>
+		<br />
+		<form action="/settings/restore" method="POST">
+			<button class="unsubscribe" type="submit">Reset all settings, subscriptions, and filters</button>
+		</form>
 	</div>
 </div>
 

@@ -1,6 +1,9 @@
 services:
   redlib:
-    image: quay.io/redlib/redlib:latest
+    image: redlib-local:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.ubuntu
     restart: always
     container_name: "redlib"
     ports:
@@ -12,7 +15,9 @@ services:
       # - seccomp=seccomp-redlib.json
     cap_drop:
       - ALL
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false
     networks:
       - redlib
     healthcheck:

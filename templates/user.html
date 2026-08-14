@@ -6,14 +6,16 @@ body %}
 <main>
     {% if !is_filtered %}
     <div id="column_one">
+		{% if metadata_error %}<p class="listing_warn">Profile information is temporarily unavailable; available posts and comments are shown below.</p>{% endif %}
         <form id="sort">
             <div id="listing_options">
                 {% call utils::sort(["/user/", user.name.as_str()].concat(),
                 ["overview", "comments", "submitted"], listing) %}
             </div>
-            <select id="sort_select" name="sort">
-                {% call utils::options(sort.0, ["hot", "new", "top",
-                "controversial"], "") %}</select
+			<select id="sort_select" name="sort">
+				<option value="hot" {% if sort.0.is_empty() || sort.0 == "hot" %}selected{% endif %}>Hot</option>
+				<option value="new" {% if sort.0 == "new" %}selected{% endif %}>Newest first</option>
+				{% call utils::options(sort.0, ["top", "controversial"], "") %}</select
             >{% if sort.0 == "top" || sort.0 == "controversial" %}<select
                 id="timeframe"
                 name="t"
@@ -40,8 +42,8 @@ body %}
             All posts are hidden because they are NSFW. Enable "Show NSFW posts"
             in settings to view.
         </center>
-        {% endif %} {% if no_posts %}
-        <center>No posts were found.</center>
+        {% endif %} {% if no_posts && !all_posts_filtered %}
+        <p class="listing_warn">Reddit did not expose any activity for this profile. Public posts or comments may still exist elsewhere.</p>
         {% endif %} {% if all_posts_filtered %}
         <center>(All content on this page has been filtered)</center>
         {% else %}
@@ -63,7 +65,7 @@ body %}
                             class="comment_link"
                             href="{{ post.permalink }}#{{ post.id }}"
                             title="{{ post.link_title }}"
-                            >{{ post.link_title }}</a
+							>{% if post.link_title.is_empty() %}Comment{% else %}{{ post.link_title }}{% endif %}</a
                         >
                         <div class="user_comment_data_divider">
                             <span class="created-in">&nbsp;in&nbsp;</span>
@@ -78,7 +80,7 @@ body %}
                             >
                         </div>
                     </summary>
-                    <p class="comment_body">{{ post.body|safe }}</p>
+					<div class="comment_body">{% if post.body.is_empty() %}<i>[content unavailable]</i>{% else %}{{ post.body|safe }}{% endif %}</div>
                 </details>
             </div>
             {% endif %} {% endfor %} {% if prefs.use_hls == "on" %}
@@ -109,22 +111,31 @@ body %}
         {% if is_filtered %}
         <center>(Content from u/{{ user.name }} has been filtered)</center>
         {% endif %}
-        <div class="panel" id="user">
-            <img
+		<div class="panel" id="user">
+			{% if !user.banner.is_empty() %}
+			<img loading="lazy" id="user_banner" src="{{ user.banner }}" alt="Banner for u/{{ user.name }}" />
+			{% endif %}
+			{% if !user.icon.is_empty() %}
+			<img
                 loading="lazy"
                 id="user_icon"
                 src="{{ user.icon }}"
                 alt="User icon"
-            />
-            <h1 id="user_title">{{ user.title }}</h1>
-            <p id="user_name">u/{{ user.name }}</p>
-            <div id="user_description">{{ user.description }}</div>
-            <div id="user_details">
-                <label>Karma</label>
-                <label>Created</label>
-                <div>{{ user.karma }}</div>
-                <div>{{ user.created }}</div>
-            </div>
+			/>
+			{% endif %}
+			{% if !user.title.is_empty() %}<h1 id="user_title">{{ user.title }}</h1>{% endif %}
+			<p id="user_name">u/{{ user.name }}</p>
+			{% if metadata_error %}
+			<p class="listing_warn">Profile details are temporarily unavailable.</p>
+			{% else %}
+			{% if !user.description.is_empty() %}<div id="user_description">{{ user.description }}</div>{% endif %}
+			<div id="user_details">
+				<label>Karma</label>
+				<label>Created</label>
+				<div title="{{ karma.1 }}">{{ karma.0 }}</div>
+				<div>{{ user.created }}</div>
+			</div>
+			{% endif %}
             <div id="user_actions">
                 {% let name = ["u_", user.name.as_str()].join("") %}
                 <div id="user_subscription">
@@ -161,16 +172,6 @@ body %}
                     </form>
                     {% endif %}
                 </div>
-                {% if crate::utils::enable_rss() %}
-                <div id="user_rss">
-                    <a
-                        href="/u/{{ user.name }}.rss"
-                        title="RSS feed for u/{{ user.name }}"
-                    >
-                        <button class="subscribe">RSS feed</button>
-                    </a>
-                </div>
-                {% endif %}
             </div>
         </div>
     </aside>

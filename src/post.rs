@@ -1,16 +1,14 @@
 #![allow(clippy::cmp_owned)]
 use crate::client::json;
-use crate::config::get_setting;
 use crate::server::RequestExt;
 use crate::subreddit::{can_access_quarantine, quarantine};
 use crate::utils::{
-	error, format_num, get_filters, nsfw_landing, param, parse_post, rewrite_emotes, setting, template, time, val, Author, Awards, Comment, Flair, FlairPart, Post, Preferences,
+	embed_comment_gifs, error, format_num, get_filters, nsfw_landing, param, parse_post, rewrite_emotes, setting, template, time, val, Author, Awards, Comment, Flair,
+	FlairPart, Post, Preferences,
 };
 use askama::Template;
 use hyper::{Body, Request, Response};
-use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
 
 // STRUCTS
 #[derive(Template)]
@@ -21,19 +19,23 @@ struct PostTemplate {
 	sort: String,
 	prefs: Preferences,
 	single_thread: bool,
-	url: String,
 	url_without_query: String,
 	comment_query: String,
 }
 
-static COMMENT_SEARCH_CAPTURE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\?q=(.*)&type=comment").unwrap());
+#[derive(Template)]
+#[template(path = "inline_comments.html")]
+struct InlineCommentsTemplate {
+	comments: Vec<Comment>,
+}
 
 pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
+	let comments_only = req.headers().get("X-Redlib-Comments-Only").is_some_and(|value| value == "1");
+
 	// Build Reddit API path
 	let mut path: String = format!("{}.json?{}&raw_json=1", req.uri().path(), req.uri().query().unwrap_or_default());
 	let sub = req.param("sub").unwrap_or_default();
 	let quarantined = can_access_quarantine(&req, &sub);
-	let url = req.uri().to_string();
 
 	// Set sort to sort query parameter
 	let sort = param(&path, "sort").unwrap_or_else(|| {
@@ -71,29 +73,43 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 				return Ok(nsfw_landing(req, req_url).await.unwrap_or_default());
 			}
 
-			let query_body = match COMMENT_SEARCH_CAPTURE.captures(&url) {
-				Some(captures) => captures.get(1).unwrap().as_str().replace("%20", " ").replace('+', " "),
-				None => String::new(),
+			let form = url::form_urlencoded::parse(req.uri().query().unwrap_or_default().as_bytes()).collect::<HashMap<_, _>>();
+			let query = if form.get("type").is_some_and(|value| value == "comment") {
+				form.get("q").map_or_else(String::new, |value| value.to_string())
+			} else {
+				String::new()
 			};
-
-			let query_string = format!("q={query_body}&type=comment");
-			let form = url::form_urlencoded::parse(query_string.as_bytes()).collect::<HashMap<_, _>>();
-			let query = form.get("q").unwrap().clone().to_string();
+			let retained_query = form
+				.iter()
+				.filter(|(key, _)| key.as_ref() != "q" && key.as_ref() != "type")
+				.fold(url::form_urlencoded::Serializer::new(String::new()), |mut serializer, (key, value)| {
+					serializer.append_pair(key, value);
+					serializer
+				})
+				.finish();
+			let url_without_query = if retained_query.is_empty() {
+				req.uri().path().to_string()
+			} else {
+				format!("{}?{retained_query}", req.uri().path())
+			};
 
 			let comments = match query.as_str() {
 				"" => parse_comments(&response[1], &post.permalink, &post.author.name, highlighted_comment, &get_filters(&req), &req),
 				_ => query_comments(&response[1], &post.permalink, &post.author.name, highlighted_comment, &get_filters(&req), &query, &req),
 			};
 
+			if comments_only {
+				return Ok(template(&InlineCommentsTemplate { comments }));
+			}
+
 			// Use the Post and Comment structs to generate a website to show users
 			Ok(template(&PostTemplate {
 				comments,
 				post,
-				url_without_query: url.clone().trim_end_matches(&format!("?q={query}&type=comment")).to_string(),
+				url_without_query,
 				sort,
 				prefs: Preferences::new(&req),
 				single_thread,
-				url: req_url,
 				comment_query: query,
 			}))
 		}
@@ -171,14 +187,17 @@ fn build_comment(
 ) -> Comment {
 	let id = val(comment, "id");
 
-	let body = if (val(comment, "author") == "[deleted]" && val(comment, "body") == "[removed]") || val(comment, "body") == "[ Removed by Reddit ]" {
-		format!(
-			"<div class=\"md\"><p>[removed] — <a href=\"https://{}{post_link}{id}\">view removed comment</a></p></div>",
-			get_setting("REDLIB_PUSHSHIFT_FRONTEND").unwrap_or_else(|| String::from(crate::config::DEFAULT_PUSHSHIFT_FRONTEND)),
-		)
+	let raw_body = val(comment, "body");
+	let body = if raw_body == "[ Removed by Reddit ]" {
+		"<div class=\"md\"><p>[removed by Reddit]</p></div>".to_string()
+	} else if raw_body == "[removed]" {
+		"<div class=\"md\"><p>[removed by moderators]</p></div>".to_string()
+	} else if raw_body == "[deleted]" {
+		"<div class=\"md\"><p>[deleted by author]</p></div>".to_string()
 	} else {
 		rewrite_emotes(&data["media_metadata"], val(comment, "body_html"))
 	};
+	let body = if setting(req, "embed_comment_gifs") == "on" { embed_comment_gifs(&body) } else { body };
 	let kind = comment["kind"].as_str().unwrap_or_default().to_string();
 
 	let unix_time = data["created_utc"].as_f64().unwrap_or_default();
@@ -201,6 +220,17 @@ fn build_comment(
 	let parent_info = parent_kind_and_id.split('_').collect::<Vec<&str>>();
 
 	let highlighted = id == highlighted_comment;
+	let navigation_query = req
+		.uri()
+		.query()
+		.into_iter()
+		.flat_map(|query| url::form_urlencoded::parse(query.as_bytes()))
+		.filter(|(key, _)| key == "sort")
+		.fold(url::form_urlencoded::Serializer::new(String::new()), |mut serializer, (key, value)| {
+			serializer.append_pair(&key, &value);
+			serializer
+		})
+		.finish();
 
 	let author = Author {
 		name: val(comment, "author"),
@@ -210,13 +240,16 @@ fn build_comment(
 				data["author_flair_richtext"].as_array(),
 				data["author_flair_text"].as_str(),
 			),
-			text: val(comment, "link_flair_text"),
+			text: val(comment, "author_flair_text"),
 			background_color: val(comment, "author_flair_background_color"),
 			foreground_color: val(comment, "author_flair_text_color"),
 		},
 		distinguished: val(comment, "distinguished"),
 	};
-	let is_filtered = filters.contains(&["u_", author.name.as_str()].concat());
+	let is_filtered = filters.iter().any(|filter| {
+		filter.strip_prefix("u_").is_some_and(|name| name.eq_ignore_ascii_case(&author.name))
+			|| filter.strip_prefix("author:").is_some_and(|name| name.eq_ignore_ascii_case(&author.name))
+	});
 
 	// Many subreddits have a default comment posted about the sub's rules etc.
 	// Many Redlib users do not wish to see this kind of comment by default.
@@ -249,6 +282,7 @@ fn build_comment(
 		collapsed,
 		is_filtered,
 		more_count,
+		navigation_query,
 		prefs: Preferences::new(req),
 	}
 }

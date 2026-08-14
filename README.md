@@ -399,10 +399,11 @@ Redlib supports the following command line flags:
 
 - `-4`, `--ipv4-only`: Listen on IPv4 only.
 - `-6`, `--ipv6-only`: Listen on IPv6 only.
-- `-r`, `--redirect-https`: Redirect all HTTP requests to HTTPS (no longer functional).
 - `-a`, `--address <ADDRESS>`: Sets address to listen on. Default is `[::]`.
 - `-p`, `--port <PORT>`: Port to listen on. Default is `8080`.
 - `-H`, `--hsts <EXPIRE_TIME>`: HSTS header to tell browsers that this site should only be accessed over HTTPS. Default is `604800`.
+
+Subscriptions and content filters are stored locally in browser cookies. In addition to subreddit and user filters, the settings page supports `domain:`, `flair:`, `author:`, `type:`, and `title:` filters; applying them does not make extra requests to Reddit.
 
 ## Instance settings
 
@@ -413,10 +414,7 @@ Assign a default value for each instance-specific setting by passing environment
 | `SFW_ONLY`                | `["on", "off"]` | `off`                  | Enables SFW-only mode for the instance, i.e. all NSFW content is filtered.                                |
 | `BANNER`                  | String          | (empty)                | Allows the server to set a banner to be displayed. Currently this is displayed on the instance info page. |
 | `ROBOTS_DISABLE_INDEXING` | `["on", "off"]` | `off`                  | Disables indexing of the instance by search engines.                                                      |
-| `PUSHSHIFT_FRONTEND`      | String          | `undelete.pullpush.io` | Allows the server to set the Pushshift frontend to be used with "removed" links.                          |
 | `PORT`                    | Integer 0-65535 | `8080`                 | The **internal** port Redlib listens on.                                                                  |
-| `ENABLE_RSS`              | `["on", "off"]` | `off`                  | Enables RSS feed generation.                                                                              |
-| `FULL_URL`                | String          | (empty)                | Allows for proper URLs (for now, only needed by RSS)                                                      |
 
 ## Default user settings
 

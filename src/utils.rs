@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 #![allow(clippy::cmp_owned)]
 
-use crate::config::{self, get_setting};
+use crate::config::get_setting;
 use crate::{client::json, server::RequestExt};
 use askama::Template;
 use cookie::Cookie;
+use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
 use hyper::{Body, Request, Response};
-use libflate::deflate::{Decoder, Encoder};
 use log::error;
 use regex::Regex;
 use revision::revisioned;
@@ -55,6 +55,13 @@ pub struct Flair {
 	pub text: String,
 	pub background_color: String,
 	pub foreground_color: String,
+}
+
+impl Flair {
+	/// Whether an emoji-only flair has a text label that can clarify its meaning.
+	pub fn needs_text_label(&self) -> bool {
+		!self.text.trim().is_empty() && self.flair_parts.iter().all(|part| part.flair_part_type != "text")
+	}
 }
 
 /// Part of flair, either emoji or text
@@ -347,7 +354,6 @@ pub struct Post {
 	pub gallery: Vec<GalleryMedia>,
 	pub awards: Awards,
 	pub nsfw: bool,
-	pub out_url: Option<String>,
 	pub ws_url: String,
 }
 
@@ -402,7 +408,7 @@ impl Post {
 							data["author_flair_richtext"].as_array(),
 							data["author_flair_text"].as_str(),
 						),
-						text: val(post, "link_flair_text"),
+						text: val(post, "author_flair_text"),
 						background_color: val(post, "author_flair_background_color"),
 						foreground_color: val(post, "author_flair_text_color"),
 					},
@@ -456,7 +462,6 @@ impl Post {
 				awards,
 				nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
 				ws_url: val(post, "websocket_url"),
-				out_url: post["data"]["url_overridden_by_dest"].as_str().map(|a| a.to_string()),
 			});
 		}
 		Ok((posts, res["data"]["after"].as_str().unwrap_or_default().to_string()))
@@ -485,6 +490,7 @@ pub struct Comment {
 	pub collapsed: bool,
 	pub is_filtered: bool,
 	pub more_count: i64,
+	pub navigation_query: String,
 	pub prefs: Preferences,
 }
 
@@ -618,7 +624,7 @@ pub struct Params {
 }
 
 #[derive(Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
-#[revisioned(revision = 1)]
+#[revisioned(revision = 2)]
 pub struct Preferences {
 	#[revision(start = 1)]
 	#[serde(skip_serializing, skip_deserializing)]
@@ -667,6 +673,18 @@ pub struct Preferences {
 	pub hide_score: String,
 	#[revision(start = 1)]
 	pub remove_default_feeds: String,
+	#[revision(start = 2)]
+	#[serde(skip_serializing, skip_deserializing)]
+	pub embed_comment_gifs: String,
+	#[revision(start = 2)]
+	#[serde(skip_serializing, skip_deserializing)]
+	pub disable_gifs_on_metered: String,
+	#[revision(start = 2)]
+	#[serde(skip_serializing, skip_deserializing)]
+	pub comment_gif_limit: String,
+	#[revision(start = 2)]
+	#[serde(skip_serializing, skip_deserializing)]
+	pub comment_gif_total_mb: String,
 }
 
 fn serialize_vec_with_plus<S>(vec: &[String], serializer: S) -> Result<S::Ok, S::Error>
@@ -725,6 +743,10 @@ impl Preferences {
 			hide_awards: setting(req, "hide_awards"),
 			hide_score: setting(req, "hide_score"),
 			remove_default_feeds: setting(req, "remove_default_feeds"),
+			embed_comment_gifs: setting(req, "embed_comment_gifs"),
+			disable_gifs_on_metered: setting_or_default(req, "disable_gifs_on_metered", "on".to_string()),
+			comment_gif_limit: setting_or_default(req, "comment_gif_limit", "10".to_string()),
+			comment_gif_total_mb: setting_or_default(req, "comment_gif_total_mb", "40".to_string()),
 		}
 	}
 
@@ -744,15 +766,15 @@ impl Preferences {
 }
 
 pub fn deflate_compress(i: Vec<u8>) -> Result<Vec<u8>, String> {
-	let mut e = Encoder::new(Vec::new());
+	let mut e = DeflateEncoder::new(Vec::new(), Compression::default());
 	e.write_all(&i).map_err(|e| e.to_string())?;
-	e.finish().into_result().map_err(|e| e.to_string())
+	e.finish().map_err(|e| e.to_string())
 }
 
 pub fn deflate_decompress(i: Vec<u8>) -> Result<Vec<u8>, String> {
-	let mut decoder = Decoder::new(&i[..]);
+	let mut decoder = DeflateDecoder::new(&i[..]);
 	let mut out = Vec::new();
-	decoder.read_to_end(&mut out).map_err(|e| format!("Failed to read from gzip decoder: {e}"))?;
+	decoder.read_to_end(&mut out).map_err(|e| format!("Failed to read from deflate decoder: {e}"))?;
 	Ok(out)
 }
 
@@ -774,7 +796,21 @@ pub fn filter_posts(posts: &mut Vec<Post>, filters: &HashSet<String>) -> (u64, b
 	if posts.is_empty() {
 		(0, false)
 	} else {
-		posts.retain(|p| !(filters.contains(&p.community) || filters.contains(&["u_", &p.author.name].concat())));
+		posts.retain(|post| {
+			!filters.iter().any(|filter| {
+				let filter_lower = filter.to_ascii_lowercase();
+				let (kind, value) = filter_lower.split_once(':').unwrap_or(("community", filter_lower.as_str()));
+				match kind {
+					"community" => post.community.eq_ignore_ascii_case(value) || filter_lower.strip_prefix("u_").is_some_and(|user| post.author.name.eq_ignore_ascii_case(user)),
+					"domain" => post.domain.eq_ignore_ascii_case(value),
+					"flair" => post.flair.text.to_ascii_lowercase().contains(value),
+					"author" => post.author.name.eq_ignore_ascii_case(value),
+					"type" => post.post_type.eq_ignore_ascii_case(value),
+					"title" => post.title.to_ascii_lowercase().contains(value),
+					_ => false,
+				}
+			})
+		});
 
 		// Get the length of the Vec<Post> after applying the filter.
 		// If lb > la, then at least one post was removed.
@@ -798,16 +834,12 @@ pub async fn parse_post(post: &Value) -> Post {
 	let created_ts = post["data"]["created_utc"].as_f64().unwrap_or_default().round() as u64;
 
 	let awards: Awards = Awards::parse(&post["data"]["all_awardings"]);
-
 	let permalink = val(post, "permalink");
 
 	let poll = Poll::parse(&post["data"]["poll_data"]);
 
-	let body = if val(post, "removed_by_category") == "moderator" {
-		format!(
-			"<div class=\"md\"><p>[removed] — <a href=\"https://{}{permalink}\">view removed post</a></p></div>",
-			get_setting("REDLIB_PUSHSHIFT_FRONTEND").unwrap_or_else(|| String::from(crate::config::DEFAULT_PUSHSHIFT_FRONTEND)),
-		)
+	let body = if !val(post, "removed_by_category").is_empty() {
+		"<div class=\"md\"><p>[removed]</p></div>".to_string()
 	} else {
 		let selftext = val(post, "selftext");
 		if selftext.contains("```") {
@@ -834,7 +866,7 @@ pub async fn parse_post(post: &Value) -> Post {
 					post["data"]["author_flair_richtext"].as_array(),
 					post["data"]["author_flair_text"].as_str(),
 				),
-				text: val(post, "link_flair_text"),
+				text: val(post, "author_flair_text"),
 				background_color: val(post, "author_flair_background_color"),
 				foreground_color: val(post, "author_flair_text_color"),
 			},
@@ -884,7 +916,6 @@ pub async fn parse_post(post: &Value) -> Post {
 		awards,
 		nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
 		ws_url: val(post, "websocket_url"),
-		out_url: post["data"]["url_overridden_by_dest"].as_str().map(|a| a.to_string()),
 	}
 }
 
@@ -1000,18 +1031,14 @@ pub async fn catch_random(sub: &str, additional: &str) -> Result<Response<Body>,
 	}
 }
 
-static REGEX_URL_WWW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://www\.reddit\.com/(.*)").unwrap());
 static REGEX_URL_OLD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://old\.reddit\.com/(.*)").unwrap());
 static REGEX_URL_NP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://np\.reddit\.com/(.*)").unwrap());
 static REGEX_URL_PLAIN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://reddit\.com/(.*)").unwrap());
-static REGEX_URL_VIDEOS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://v\.redd\.it/(.*)/DASH_([0-9]{2,4}(\.mp4|$|\?source=fallback))").unwrap());
+static REGEX_URL_VIDEOS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://v\.redd\.it/([^/?]+)/(DASH|CMAF)_([0-9]{2,4}(\.mp4|$|\?source=fallback))").unwrap());
 static REGEX_URL_VIDEOS_HLS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://v\.redd\.it/(.+)/(HLSPlaylist\.m3u8.*)$").unwrap());
-static REGEX_URL_IMAGES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://i\.redd\.it/(.*)").unwrap());
 static REGEX_URL_THUMBS_A: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://a\.thumbs\.redditmedia\.com/(.*)").unwrap());
 static REGEX_URL_THUMBS_B: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://b\.thumbs\.redditmedia\.com/(.*)").unwrap());
 static REGEX_URL_EMOJI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://emoji\.redditmedia\.com/(.*)/(.*)").unwrap());
-static REGEX_URL_PREVIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://preview\.redd\.it/(.*)").unwrap());
-static REGEX_URL_EXTERNAL_PREVIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://external\-preview\.redd\.it/(.*)").unwrap());
 static REGEX_URL_STYLES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://styles\.redditmedia\.com/(.*)").unwrap());
 static REGEX_URL_STATIC_MEDIA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://www\.redditstatic\.com/(.*)").unwrap());
 
@@ -1022,11 +1049,20 @@ pub fn format_url(url: &str) -> String {
 	} else {
 		Url::parse(url).map_or(url.to_string(), |parsed| {
 			let domain = parsed.domain().unwrap_or_default();
+			let path_and_query = || {
+				let mut value = parsed.path().trim_start_matches('/').to_string();
+				if let Some(query) = parsed.query() {
+					value.push('?');
+					value.push_str(query);
+				}
+				value
+			};
 
 			let capture = |regex: &Regex, format: &str, segments: i16| {
 				regex.captures(url).map_or(String::new(), |caps| match segments {
 					1 => [format, &caps[1]].join(""),
 					2 => [format, &caps[1], "/", &caps[2]].join(""),
+					3 => [format, &caps[1], "/", &caps[2], "/", &caps[3]].join(""),
 					_ => String::new(),
 				})
 			};
@@ -1053,17 +1089,17 @@ pub fn format_url(url: &str) -> String {
 			}
 
 			match domain {
-				"www.reddit.com" => capture(&REGEX_URL_WWW, "/", 1),
+				"www.reddit.com" | "new.reddit.com" | "amp.reddit.com" => format!("/{}", path_and_query()),
 				"old.reddit.com" => capture(&REGEX_URL_OLD, "/", 1),
 				"np.reddit.com" => capture(&REGEX_URL_NP, "/", 1),
 				"reddit.com" => capture(&REGEX_URL_PLAIN, "/", 1),
-				"v.redd.it" => chain!(capture(&REGEX_URL_VIDEOS, "/vid/", 2), capture(&REGEX_URL_VIDEOS_HLS, "/hls/", 2)),
-				"i.redd.it" => capture(&REGEX_URL_IMAGES, "/img/", 1),
+				"v.redd.it" => chain!(capture(&REGEX_URL_VIDEOS, "/vid/", 3), capture(&REGEX_URL_VIDEOS_HLS, "/hls/", 2)),
+				"i.redd.it" => format!("/img/{}", path_and_query()),
 				"a.thumbs.redditmedia.com" => capture(&REGEX_URL_THUMBS_A, "/thumb/a/", 1),
 				"b.thumbs.redditmedia.com" => capture(&REGEX_URL_THUMBS_B, "/thumb/b/", 1),
 				"emoji.redditmedia.com" => capture(&REGEX_URL_EMOJI, "/emoji/", 2),
-				"preview.redd.it" => capture(&REGEX_URL_PREVIEW, "/preview/pre/", 1),
-				"external-preview.redd.it" => capture(&REGEX_URL_EXTERNAL_PREVIEW, "/preview/external-pre/", 1),
+				"preview.redd.it" => format!("/preview/pre/{}", path_and_query()),
+				"external-preview.redd.it" => format!("/preview/external-pre/{}", path_and_query()),
 				"styles.redditmedia.com" => capture(&REGEX_URL_STYLES, "/style/", 1),
 				"www.redditstatic.com" => capture(&REGEX_URL_STATIC_MEDIA, "/static/", 1),
 				_ => url.to_string(),
@@ -1089,6 +1125,60 @@ static REDDIT_PREVIEW_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"htt
 static REDDIT_EMOJI_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://(www|).redditstatic\.com/(.*)").unwrap());
 static REDLIB_PREVIEW_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/(img|preview/)(pre|external-pre)?/(.*?)>"#).unwrap());
 static REDLIB_PREVIEW_TEXT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r">(.*?)</a>").unwrap());
+static GIPHY_PAGE_COMMENT_LINK_REGEX: LazyLock<Regex> =
+	LazyLock::new(|| Regex::new(r#"<a href="(https?://(?:www\.)?giphy\.com/(?:gifs|clips)/([^"?#]+)(?:[?#][^"]*)?)">([^<]*)</a>"#).unwrap());
+static GIPHY_MEDIA_COMMENT_LINK_REGEX: LazyLock<Regex> =
+	LazyLock::new(|| Regex::new(r#"<a href="(https?://media\.giphy\.com/media/([A-Za-z0-9]+)(?:/[^"?#]*)?(?:[?#][^"]*)?)">([^<]*)</a>"#).unwrap());
+static GIPHY_IMAGE_COMMENT_LINK_REGEX: LazyLock<Regex> =
+	LazyLock::new(|| Regex::new(r#"<a href="(https?://i\.giphy\.com/(?:media/)?([A-Za-z0-9]+)(?:/[^"?#]*)?(?:\.[A-Za-z0-9]+)?(?:[?#][^"]*)?)">([^<]*)</a>"#).unwrap());
+static IMGUR_COMMENT_LINK_REGEX: LazyLock<Regex> =
+	LazyLock::new(|| Regex::new(r#"<a href="(https://i\.imgur\.com/([A-Za-z0-9]+)\.(?:gifv?|mp4)(?:\?[^"]*)?)">([^<]*)</a>"#).unwrap());
+static REDDIT_COMMENT_GIF_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<a href="(/img/([^"?#]+\.gif)(?:\?[^"]*)?)">([^<]*)</a>"#).unwrap());
+
+/// Convert a deliberately small allowlist of comment GIF links into lazy,
+/// muted video previews. The original URL remains the enclosing destination.
+pub fn embed_comment_gifs(input: &str) -> String {
+	let render_giphy = |source: &str, id: &str, original: &str| {
+		if id.is_empty() || !id.chars().all(|character| character.is_ascii_alphanumeric()) {
+			return original.to_string();
+		}
+		format!(
+			r#"<a class="comment_gif_source" href="{source}"><video class="comment_gif" data-src="/comment-gif/giphy/{id}" muted loop autoplay playsinline preload="none"></video><span class="comment_gif_label">GIF — tap for source</span></a>"#
+		)
+	};
+
+	let with_giphy_pages = GIPHY_PAGE_COMMENT_LINK_REGEX
+		.replace_all(input, |caps: &regex::Captures<'_>| {
+			let slug = &caps[2];
+			let id = slug.rsplit('-').next().unwrap_or(slug);
+			render_giphy(&caps[1], id, &caps[0])
+		})
+		.to_string();
+	let with_giphy_media = GIPHY_MEDIA_COMMENT_LINK_REGEX
+		.replace_all(&with_giphy_pages, |caps: &regex::Captures<'_>| render_giphy(&caps[1], &caps[2], &caps[0]))
+		.to_string();
+	let with_giphy = GIPHY_IMAGE_COMMENT_LINK_REGEX
+		.replace_all(&with_giphy_media, |caps: &regex::Captures<'_>| render_giphy(&caps[1], &caps[2], &caps[0]))
+		.to_string();
+
+	let with_imgur = IMGUR_COMMENT_LINK_REGEX
+		.replace_all(&with_giphy, |caps: &regex::Captures<'_>| {
+			format!(
+				r#"<a class="comment_gif_source" href="{}"><video class="comment_gif" data-src="/comment-gif/imgur/{}" muted loop autoplay playsinline preload="none"></video><span class="comment_gif_label">GIF — tap for source</span></a>"#,
+				&caps[1], &caps[2]
+			)
+		})
+		.to_string();
+
+	REDDIT_COMMENT_GIF_LINK_REGEX
+		.replace_all(&with_imgur, |caps: &regex::Captures<'_>| {
+			format!(
+				r#"<a class="comment_gif_source" href="{}"><img class="comment_gif" data-src="/comment-gif/reddit/{}" alt="GIF preview" loading="lazy"><span class="comment_gif_label">GIF — tap for source</span></a>"#,
+				&caps[1], &caps[2]
+			)
+		})
+		.to_string()
+}
 
 /// Rewrite Reddit links to Redlib in body of text
 pub fn rewrite_urls(input_text: &str) -> String {
@@ -1359,16 +1449,6 @@ pub fn sfw_only() -> bool {
 	}
 }
 
-/// Returns true if the config/env variable REDLIB_ENABLE_RSS is set to "on".
-/// If this variable is set as such, the instance will enable RSS feeds.
-/// Otherwise, the instance will not provide RSS feeds.
-pub fn enable_rss() -> bool {
-	match get_setting("REDLIB_ENABLE_RSS") {
-		Some(val) => val == "on",
-		None => false,
-	}
-}
-
 /// Returns true if the config/env variable `REDLIB_ROBOTS_DISABLE_INDEXING` carries the
 /// value `on`.
 ///
@@ -1430,28 +1510,11 @@ pub fn url_path_basename(path: &str) -> String {
 	}
 }
 
-/// Returns the absolute URL of a post, as needed by RSS feeds
-pub fn get_post_url(post: &Post) -> String {
-	match post.post_type.as_str() {
-		"image" | "gallery" | "gif" | "video" => return to_absolute_url(&post.permalink),
-		_ => {}
-	}
-
-	if let Some(out_url) = &post.out_url {
-		return if out_url.starts_with("/r/") { to_absolute_url(out_url) } else { out_url.clone() };
-	}
-
-	to_absolute_url(&post.permalink)
-}
-
-/// Returns an absolute URL given a relative URL, as needed by RSS feeds
-pub fn to_absolute_url(relative_path: &str) -> String {
-	format!("{}{}", config::get_setting("REDLIB_FULL_URL").unwrap_or_default(), relative_path)
-}
-
 #[cfg(test)]
 mod tests {
-	use super::{deflate_compress, deflate_decompress, format_num, format_url, render_bullet_lists, rewrite_emotes, rewrite_urls, url_path_basename, Post, Preferences};
+	use super::{
+		deflate_compress, deflate_decompress, embed_comment_gifs, format_num, format_url, render_bullet_lists, rewrite_emotes, rewrite_urls, url_path_basename, Post, Preferences,
+	};
 
 	#[test]
 	fn format_num_works() {
@@ -1498,10 +1561,16 @@ mod tests {
 
 		assert_eq!(format_url("https://i.redd.it/foobar.jpg"), "/img/foobar.jpg");
 		assert_eq!(
+			format_url("https://new.reddit.com/r/rust/comments/abc/title/?context=3"),
+			"/r/rust/comments/abc/title/?context=3"
+		);
+		assert_eq!(format_url("https://amp.reddit.com/r/rust/comments/abc/title/"), "/r/rust/comments/abc/title/");
+		assert_eq!(
 			format_url("https://preview.redd.it/qwerty.jpg?auto=webp&s=asdf"),
 			"/preview/pre/qwerty.jpg?auto=webp&s=asdf"
 		);
-		assert_eq!(format_url("https://v.redd.it/foo/DASH_360.mp4?source=fallback"), "/vid/foo/360.mp4");
+		assert_eq!(format_url("https://v.redd.it/foo/DASH_360.mp4?source=fallback"), "/vid/foo/DASH/360.mp4");
+		assert_eq!(format_url("https://v.redd.it/foo/CMAF_720.mp4"), "/vid/foo/CMAF/720.mp4");
 		assert_eq!(
 			format_url("https://v.redd.it/foo/HLSPlaylist.m3u8?a=bar&v=1&f=sd"),
 			"/hls/foo/HLSPlaylist.m3u8?a=bar&v=1&f=sd"
@@ -1543,10 +1612,53 @@ mod tests {
 			hide_awards: "off".to_owned(),
 			hide_score: "off".to_owned(),
 			remove_default_feeds: "off".to_owned(),
+			embed_comment_gifs: "on".to_owned(),
+			disable_gifs_on_metered: "on".to_owned(),
+			comment_gif_limit: "10".to_owned(),
+			comment_gif_total_mb: "40".to_owned(),
 		};
 		let urlencoded = serde_urlencoded::to_string(prefs).expect("Failed to serialize Prefs");
 
 		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&video_quality=best&hide_sidebar_and_summary=off&use_hls=on&autoplay_videos=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&hide_awards=off&hide_score=off&remove_default_feeds=off");
+	}
+
+	#[test]
+	fn embeds_allowlisted_comment_gifs_as_muted_video_links() {
+		let giphy = r#"<p><a href="https://giphy.com/gifs/funny-cat-AbC123">reaction</a></p>"#;
+		let rendered = embed_comment_gifs(giphy);
+		assert!(rendered.contains(r#"href="https://giphy.com/gifs/funny-cat-AbC123""#));
+		assert!(rendered.contains(r#"data-src="/comment-gif/giphy/AbC123""#));
+		assert!(rendered.contains("muted loop autoplay playsinline"));
+
+		let giphy_media = r#"<p><a href="https://media.giphy.com/media/XyZ987/giphy.gif">reaction</a></p>"#;
+		let rendered = embed_comment_gifs(giphy_media);
+		assert!(rendered.contains(r#"href="https://media.giphy.com/media/XyZ987/giphy.gif""#));
+		assert!(rendered.contains(r#"data-src="/comment-gif/giphy/XyZ987""#));
+
+		let giphy_image = r#"<p><a href="https://i.giphy.com/Qwe456.gif">reaction</a></p>"#;
+		let rendered = embed_comment_gifs(giphy_image);
+		assert!(rendered.contains(r#"href="https://i.giphy.com/Qwe456.gif""#));
+		assert!(rendered.contains(r#"data-src="/comment-gif/giphy/Qwe456""#));
+
+		let giphy_image_media = r#"<p><a href="https://i.giphy.com/media/Rty321/giphy.gif">reaction</a></p>"#;
+		let rendered = embed_comment_gifs(giphy_image_media);
+		assert!(rendered.contains(r#"data-src="/comment-gif/giphy/Rty321""#));
+
+		let imgur = r#"<p><a href="https://i.imgur.com/Z9y8X7.gifv">image</a></p>"#;
+		let rendered = embed_comment_gifs(imgur);
+		assert!(rendered.contains(r#"href="https://i.imgur.com/Z9y8X7.gifv""#));
+		assert!(rendered.contains(r#"data-src="/comment-gif/imgur/Z9y8X7""#));
+
+		let reddit = r#"<p><a href="/img/74epxqndv2fh1.gif">/img/74epxqndv2fh1.gif</a></p>"#;
+		let rendered = embed_comment_gifs(reddit);
+		assert!(rendered.contains(r#"href="/img/74epxqndv2fh1.gif""#));
+		assert!(rendered.contains(r#"<img class="comment_gif" data-src="/comment-gif/reddit/74epxqndv2fh1.gif""#));
+	}
+
+	#[test]
+	fn leaves_unapproved_comment_media_as_a_normal_link() {
+		let input = r#"<p><a href="https://example.com/reaction.gif">reaction</a></p>"#;
+		assert_eq!(embed_comment_gifs(input), input);
 	}
 
 	#[test]
@@ -1665,7 +1777,8 @@ How`s your monitor by the way? Any IPS bleed whatsoever? I either got lucky or t
 		for config in KNOWN_GOOD_CONFIGS {
 			let bytes = base2048::decode(config).unwrap();
 			let decompressed = deflate_decompress(bytes).unwrap();
-			assert!(bincode::deserialize::<Preferences>(&decompressed).is_ok());
+			let result = bincode::deserialize::<Preferences>(&decompressed);
+			assert!(result.is_ok(), "failed to deserialize known preferences: {result:?}");
 		}
 	}
 

@@ -5,6 +5,7 @@ use brotli::enc::{BrotliCompress, BrotliEncoderParams};
 use cached::proc_macro::cached;
 use cookie::Cookie;
 use core::f64;
+use flate2::{write::GzEncoder, Compression};
 use futures_lite::{future::Boxed, Future, FutureExt};
 use hyper::{
 	body,
@@ -14,7 +15,6 @@ use hyper::{
 	HeaderMap,
 };
 use hyper::{Body, Method, Request, Response, Server as HyperServer};
-use libflate::gzip;
 use route_recognizer::{Params, Router};
 use std::{
 	cmp::Ordering,
@@ -664,7 +664,11 @@ async fn compress_response(req_headers: &HeaderMap<header::HeaderValue>, res: &m
 	};
 
 	// Compress!
-	match compress_body(compressor, body_bytes) {
+	let compression_result = tokio::task::spawn_blocking(move || compress_body(compressor, body_bytes))
+		.await
+		.map_err(|error| format!("Compression task failed: {error}"))?;
+
+	match compression_result {
 		Ok(compressed) => {
 			// We get here iff the compression was successful. Replace the body
 			// with the compressed payload, and add the appropriate
@@ -700,16 +704,10 @@ fn compress_body(compressor: CompressionType, body_bytes: Vec<u8>) -> Result<Vec
 
 	let compressed: Vec<u8> = match compressor {
 		CompressionType::Gzip => {
-			let mut gz: gzip::Encoder<Vec<u8>> = match gzip::Encoder::new(Vec::new()) {
-				Ok(gz) => gz,
-				Err(e) => {
-					dbg_msg!(e);
-					return Err(e.to_string());
-				}
-			};
+			let mut gz = GzEncoder::new(Vec::new(), Compression::default());
 
 			match io::copy(&mut reader, &mut gz) {
-				Ok(_) => match gz.finish().into_result() {
+				Ok(_) => match gz.finish() {
 					Ok(compressed) => compressed,
 					Err(e) => {
 						dbg_msg!(e);
@@ -753,7 +751,7 @@ fn compress_body(compressor: CompressionType, body_bytes: Vec<u8>) -> Result<Vec
 mod tests {
 	use super::*;
 	use brotli::Decompressor as BrotliDecompressor;
-	use futures_lite::future::block_on;
+	use flate2::read::GzDecoder;
 	use lipsum::lipsum;
 	use std::{boxed::Box, io};
 
@@ -774,8 +772,8 @@ mod tests {
 		assert_eq!(determine_compressor("gzip;q=NAN".to_string()), None);
 	}
 
-	#[test]
-	fn test_compress_response() {
+	#[tokio::test]
+	async fn test_compress_response() {
 		// This macro generates an Accept-Encoding header value given any number of
 		// compressors.
 		macro_rules! ae_gen {
@@ -815,7 +813,7 @@ mod tests {
 				.unwrap();
 
 			// Perform the compression.
-			if let Err(e) = block_on(compress_response(&req_headers, &mut res)) {
+			if let Err(e) = compress_response(&req_headers, &mut res).await {
 				panic!("compress_response(&req_headers, &mut res) => Err(\"{e}\")");
 			};
 
@@ -836,7 +834,7 @@ mod tests {
 			//
 			// In the case of no compression, just make sure the "new" body in
 			// the Response is the same as what with which we start.
-			let body_vec = match block_on(body::to_bytes(res.body_mut())) {
+			let body_vec = match body::to_bytes(res.body_mut()).await {
 				Ok(b) => b.to_vec(),
 				Err(e) => panic!("{e}"),
 			};
@@ -847,15 +845,12 @@ mod tests {
 			}
 
 			// This provides an io::Read for the underlying body.
-			let mut body_cursor: io::Cursor<Vec<u8>> = io::Cursor::new(body_vec);
+			let body_cursor: io::Cursor<Vec<u8>> = io::Cursor::new(body_vec);
 
 			// Match the appropriate decompresor for the given
 			// expected_encoding.
 			let mut decoder: Box<dyn io::Read> = match expected_encoding {
-				CompressionType::Gzip => match gzip::Decoder::new(&mut body_cursor) {
-					Ok(dgz) => Box::new(dgz),
-					Err(e) => panic!("{e}"),
-				},
+				CompressionType::Gzip => Box::new(GzDecoder::new(body_cursor)),
 
 				CompressionType::Brotli => Box::new(BrotliDecompressor::new(body_cursor, expected_lorem_ipsum.len())),
 

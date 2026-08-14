@@ -7,8 +7,7 @@ use crate::{
 };
 use askama::Template;
 use hyper::{Body, Request, Response};
-use regex::Regex;
-use std::sync::LazyLock;
+use url::Url;
 
 // STRUCTS
 struct SearchParams {
@@ -49,8 +48,23 @@ struct SearchTemplate {
 	no_posts: bool,
 }
 
-/// Regex matched against search queries to determine if they are reddit urls.
-static REDDIT_URL_MATCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^https?://([^\./]+\.)*reddit.com/").unwrap());
+fn reddit_search_destination(query: &str) -> Option<String> {
+	let parsed = Url::parse(query).ok()?;
+	let host = parsed.host_str()?.to_ascii_lowercase();
+	let is_reddit = host == "reddit.com" || host.ends_with(".reddit.com");
+	if is_reddit {
+		let mut destination = parsed.path().to_string();
+		if let Some(query) = parsed.query() {
+			destination.push('?');
+			destination.push_str(query);
+		}
+		return Some(destination);
+	}
+	if host == "redd.it" {
+		return Some(format!("/{}", parsed.path().trim_matches('/')));
+	}
+	None
+}
 
 // SERVICES
 pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
@@ -62,8 +76,10 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 	};
 	let uri_path = req.uri().path().replace("+", "%2B");
 	let path = format!("{}.json?{}{}&raw_json=1", uri_path, req.uri().query().unwrap_or_default(), nsfw_results);
-	let mut query = param(&path, "q").unwrap_or_default();
-	query = REDDIT_URL_MATCH.replace(&query, "").to_string();
+	let query = param(&path, "q").unwrap_or_default();
+	if let Some(destination) = reddit_search_destination(&query) {
+		return Ok(redirect(&destination));
+	}
 
 	if query.is_empty() {
 		return Ok(redirect("/"));
@@ -189,4 +205,19 @@ async fn search_subreddits(q: &str, typed: &str) -> Vec<Subreddit> {
 			}
 		})
 		.collect::<Vec<Subreddit>>()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::reddit_search_destination;
+
+	#[test]
+	fn recognizes_reddit_urls() {
+		assert_eq!(
+			reddit_search_destination("https://old.reddit.com/r/rust/comments/abc/title/?context=3"),
+			Some("/r/rust/comments/abc/title/?context=3".into())
+		);
+		assert_eq!(reddit_search_destination("https://redd.it/abc123"), Some("/abc123".into()));
+		assert_eq!(reddit_search_destination("https://example.com/r/rust"), None);
+	}
 }

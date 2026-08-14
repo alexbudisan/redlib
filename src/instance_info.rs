@@ -75,7 +75,6 @@ fn info_html(req: &Request<Body>) -> Result<Response<Body>, Error> {
 		title: String::from("Instance information"),
 		body: INSTANCE_INFO.to_string(&StringType::Html),
 		prefs: Preferences::new(req),
-		url: req.uri().to_string(),
 	}
 	.render()
 	.unwrap();
@@ -85,6 +84,7 @@ fn info_html(req: &Request<Body>) -> Result<Response<Body>, Error> {
 pub struct InstanceInfo {
 	package_name: String,
 	crate_version: String,
+	build_id: String,
 	pub git_commit: String,
 	deploy_date: String,
 	compile_mode: String,
@@ -97,6 +97,7 @@ impl InstanceInfo {
 		Self {
 			package_name: env!("CARGO_PKG_NAME").to_string(),
 			crate_version: env!("CARGO_PKG_VERSION").to_string(),
+			build_id: env!("REDLIB_BUILD_ID").to_string(),
 			git_commit: env!("GIT_HASH").to_string(),
 			deploy_date: OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc()).to_string(),
 			#[cfg(debug_assertions)]
@@ -120,16 +121,13 @@ impl InstanceInfo {
 			Table::from([
 				["Package name", &self.package_name],
 				["Crate version", &self.crate_version],
+				["Build ID", &self.build_id],
 				["Git commit", &self.git_commit],
 				["Deploy date", &self.deploy_date],
 				["Deploy timestamp", &self.deploy_unix_ts.to_string()],
 				["Compile mode", &self.compile_mode],
 				["SFW only", &convert(&self.config.sfw_only)],
-				["Pushshift frontend", &convert(&self.config.pushshift)],
-				["RSS enabled", &convert(&self.config.enable_rss)],
-				["Full URL", &convert(&self.config.full_url)],
 				["Remove default feeds", &convert(&self.config.default_remove_default_feeds)],
-				//TODO: fallback to crate::config::DEFAULT_PUSHSHIFT_FRONTEND
 			])
 			.with_header_row(["Settings"]),
 		);
@@ -162,14 +160,12 @@ impl InstanceInfo {
 				format!(
 					"Package name: {}\n
 				Crate version: {}\n
+				Build ID: {}\n
                 Git commit: {}\n
                 Deploy date: {}\n
                 Deploy timestamp: {}\n
                 Compile mode: {}\n
 				SFW only: {:?}\n
-				Pushshift frontend: {:?}\n
-				RSS enabled: {:?}\n
-				Full URL: {:?}\n
 				Remove default feeds: {:?}\n
                 Config:\n
                     Banner: {:?}\n
@@ -190,15 +186,13 @@ impl InstanceInfo {
                     Default filters: {:?}\n",
 					self.package_name,
 					self.crate_version,
+					self.build_id,
 					self.git_commit,
 					self.deploy_date,
 					self.deploy_unix_ts,
 					self.compile_mode,
 					self.config.sfw_only,
-					self.config.enable_rss,
-					self.config.full_url,
 					self.config.default_remove_default_feeds,
-					self.config.pushshift,
 					self.config.banner,
 					self.config.default_hide_awards,
 					self.config.default_hide_score,
@@ -231,5 +225,4 @@ struct MessageTemplate {
 	title: String,
 	body: String,
 	prefs: Preferences,
-	url: String,
 }

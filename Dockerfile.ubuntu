@@ -1,6 +1,7 @@
 # supported versions here: https://hub.docker.com/_/rust
 ARG RUST_BUILDER_VERSION=slim-bookworm
 ARG UBUNTU_RELEASE_VERSION=noble
+ARG REDLIB_BUILD_ID=auto
 
 ########################
 ## builder image
@@ -20,6 +21,8 @@ RUN cargo build --release --locked --bin redlib
 RUN rm ./src/main.rs && rmdir ./src
 
 # copy the source and build the redlib binary
+ARG REDLIB_BUILD_ID
+ENV REDLIB_BUILD_ID=${REDLIB_BUILD_ID}
 COPY . ./
 RUN cargo build --release --locked --bin redlib
 RUN echo "finished building redlib!"
@@ -28,6 +31,12 @@ RUN echo "finished building redlib!"
 ## release image
 ########################
 FROM ubuntu:${UBUNTU_RELEASE_VERSION} AS release
+
+# Install the certificates needed for outbound HTTPS and wget for the
+# container healthcheck below. Keep the runtime image otherwise minimal.
+RUN apt-get update \
+    && apt-get -y install --no-install-recommends ca-certificates wget \
+    && rm -rf /var/lib/apt/lists/*
 
 # Import redlib binary from builder
 COPY --from=builder /redlib/target/release/redlib /usr/local/bin/redlib
@@ -44,9 +53,13 @@ USER redlib
 EXPOSE 8080
 
 # Run a healthcheck every minute to make sure redlib is functional
-HEALTHCHECK --interval=1m --timeout=3s CMD wget --spider -q http://localhost:8080/settings || exit 1
+HEALTHCHECK --interval=1m --timeout=3s --start-period=10s CMD wget --spider -q --tries=1 http://localhost:8080/settings || exit 1
 
 # Add container metadata
-LABEL org.opencontainers.image.authors="sigaloid"
+ARG REDLIB_BUILD_ID
+LABEL org.opencontainers.image.authors="sigaloid" \
+      org.opencontainers.image.title="Redlib local build" \
+      org.opencontainers.image.version="${REDLIB_BUILD_ID}" \
+      org.opencontainers.image.source="https://github.com/redlib-org/redlib"
 
 CMD ["redlib"]

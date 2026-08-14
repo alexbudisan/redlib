@@ -37,6 +37,10 @@
 	{% for flair_part in flair_parts.clone() %}{% if flair_part.flair_part_type == "emoji" %}<span class="emoji" style="background-image:url('{{ flair_part.value }}');"></span>{% else if flair_part.flair_part_type == "text" && !flair_part.value.is_empty() %}<span>{{ flair_part.value }}</span>{% endif %}{% endfor %}
 {%- endmacro %}
 
+{% macro render_author_flair(flair) -%}
+	{% call render_flair(flair.flair_parts) %}{% if flair.needs_text_label() %}<span class="author_flair_label">[{{ flair.text }}]</span>{% endif %}
+{%- endmacro %}
+
 {% macro sub_list(current) -%}
 	<details id="feeds">
 		<summary>Feeds</summary>
@@ -72,7 +76,7 @@
 		<span class="dot">&bull;</span>
 		<a class="post_author {{ post.author.distinguished }}" href="/user/{{ post.author.name }}">u/{{ post.author.name }}</a>
 		{% if post.author.flair.flair_parts.len() > 0 %}
-			<small class="author_flair">{% call render_flair(post.author.flair.flair_parts) %}</small>
+			<small class="author_flair">{% call render_author_flair(post.author.flair) %}</small>
 		{% endif %}
 		<span class="dot">&bull;</span>
 		<span class="created" title="{{ post.created }}">{{ post.rel_time }}</span>
@@ -180,12 +184,11 @@
 				</a>
 			</li>
 			{% endif %}
-			{% if post.post_type == "link" %}
-			<li class="desktop_item"><a target="_blank" href="https://archive.is/latest/{{ post.media.url }}">archive.is</a></li>
-			<li class="mobile_item"><a target="_blank" href="https://archive.is/latest/{{ post.media.url }}">archive</a></li>
+			{% if post.post_type == "link" && (post.media.url.starts_with("https://") || post.media.url.starts_with("http://")) %}
+			<li>
+				<a href="https://archive.is/newest/{{ post.media.url }}" rel="nofollow noreferrer" target="_blank">archive</a>
+			</li>
 			{% endif %}
-			{% call external_reddit_link(post.permalink) %}
-
 			{% if post.media.download_name != "" %}
 			<li>
 				<a href="{{ post.media.url }}" download="{{ post.media.download_name }}">
@@ -199,23 +202,6 @@
 	</div>
 </div>
 {%- endmacro %}
-
-{% macro external_reddit_link(permalink) %}
-<li>
-	<a
-		{% if prefs.disable_visit_reddit_confirmation != "on" %}
-		href="#popup"
-		{% else %}
-		href="https://reddit.com{{ permalink }}"
-		rel="nofollow"
-		{% endif %}
-	>reddit</a>
-
-	{% if prefs.disable_visit_reddit_confirmation != "on" %}
-		{% call visit_reddit_confirmation(permalink) %}
-	{% endif %}
-</li>
-{% endmacro %}
 
 {% macro post_in_list(post) -%}
 {% set post_should_be_blurred = (post.flags.nsfw && prefs.blur_nsfw=="on") || (post.flags.spoiler && prefs.blur_spoiler=="on") -%}
@@ -327,7 +313,6 @@
 	<div class="popup-inner">
 		<h1>You are about to leave Redlib</h1>
 		<p>Do you want to continue?</p>
-		<p id="reddit_url">https://www.reddit.com{{ url }}</p>
 		<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 639.24 563">
 			<defs>
 				<style>.cls-1{fill:#000000;}.cls-2{fill:#f8aa00;}</style>
@@ -339,7 +324,6 @@
 			<path class="cls-1" d="M319.54,473.08c-46.34,2.64-53.75-72.47-.31-75.47,49.56,.78,49.1,76.24,.31,75.47Z"/>
 		</svg>
 		<a id="goback" href="#">No, go back!</a>
-		<a id="toreddit" href="https://www.reddit.com{{ url }}" rel="nofollow">Yes, take me to Reddit</a>
 	</div>
 </div>
 {%- endmacro %}

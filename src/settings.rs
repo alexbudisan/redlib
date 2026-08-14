@@ -19,12 +19,11 @@ use url::form_urlencoded;
 #[template(path = "settings.html")]
 struct SettingsTemplate {
 	prefs: Preferences,
-	url: String,
 }
 
 // CONSTANTS
 
-const PREFS: [&str; 19] = [
+const PREFS: [&str; 23] = [
 	"theme",
 	"front_page",
 	"layout",
@@ -44,17 +43,25 @@ const PREFS: [&str; 19] = [
 	"disable_visit_reddit_confirmation",
 	"video_quality",
 	"remove_default_feeds",
+	"embed_comment_gifs",
+	"disable_gifs_on_metered",
+	"comment_gif_limit",
+	"comment_gif_total_mb",
 ];
+
+fn sanitize_preference(name: &str, value: &str) -> String {
+	match name {
+		"comment_gif_limit" => value.parse::<u16>().unwrap_or(10).min(50).to_string(),
+		"comment_gif_total_mb" => value.parse::<u16>().unwrap_or(40).clamp(1, 100).to_string(),
+		_ => value.to_owned(),
+	}
+}
 
 // FUNCTIONS
 
 /// Retrieve cookies from request "Cookie" header
 pub async fn get(req: Request<Body>) -> Result<Response<Body>, String> {
-	let url = req.uri().to_string();
-	Ok(template(&SettingsTemplate {
-		prefs: Preferences::new(&req),
-		url,
-	}))
+	Ok(template(&SettingsTemplate { prefs: Preferences::new(&req) }))
 }
 
 /// Set cookies using response "Set-Cookie" header
@@ -87,7 +94,7 @@ pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
 	for &name in &PREFS {
 		match form.get(name) {
 			Some(value) => response.insert_cookie(
-				Cookie::build((name.to_owned(), value.clone()))
+				Cookie::build((name.to_owned(), sanitize_preference(name, value)))
 					.path("/")
 					.http_only(true)
 					.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
@@ -133,7 +140,7 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 	for name in PREFS {
 		match form.get(name) {
 			Some(value) => response.insert_cookie(
-				Cookie::build((name.to_owned(), value.clone()))
+				Cookie::build((name.to_owned(), sanitize_preference(name, value)))
 					.path("/")
 					.http_only(true)
 					.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
@@ -302,4 +309,80 @@ pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, Strin
 	let url = format!("/settings/restore/?{}", prefs.to_urlencoded()?);
 
 	Ok(redirect(&url))
+}
+
+pub async fn update_list(req: Request<Body>) -> Result<Response<Body>, String> {
+	let prefs = Preferences::new(&req);
+	let body = hyper::body::to_bytes(req.into_body()).await.map_err(|e| format!("Failed to read form: {e}"))?;
+	let form = form_urlencoded::parse(&body).collect::<HashMap<_, _>>();
+	let list_kind = form.get("list_kind").map(|value| value.as_ref()).unwrap_or_default();
+	let operation = form.get("operation").map(|value| value.as_ref()).unwrap_or("add");
+	let mut value = form.get("value").map(|value| value.trim().to_string()).unwrap_or_default();
+	if value.is_empty() || value.contains('+') || value.contains(';') {
+		return Err("Invalid empty or delimited list value".to_string());
+	}
+
+	let (cookie_name, mut values) = match list_kind {
+		"subscriptions" => {
+			value = value.trim_start_matches("r/").trim_start_matches("/r/").to_string();
+			if let Some(user) = value.strip_prefix("u/").or_else(|| value.strip_prefix("/u/")) {
+				value = format!("u_{user}");
+			}
+			if !value.chars().all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-') {
+				return Err("Invalid subreddit or user name".to_string());
+			}
+			("subscriptions", prefs.subscriptions)
+		}
+		"filters" => {
+			if let Some((kind, filter_value)) = value.split_once(':') {
+				if !matches!(kind.to_ascii_lowercase().as_str(), "domain" | "flair" | "author" | "type" | "title") || filter_value.trim().is_empty() {
+					return Err("Unknown or empty content filter".to_string());
+				}
+			}
+			("filters", prefs.filters)
+		}
+		_ => return Err("Unknown settings list".to_string()),
+	};
+
+	if operation == "remove" {
+		values.retain(|item| !item.eq_ignore_ascii_case(&value));
+	} else if !values.iter().any(|item| item.eq_ignore_ascii_case(&value)) {
+		values.push(value);
+	}
+	values.sort_by_key(|item| item.to_ascii_lowercase());
+
+	let mut response = redirect("/settings");
+	let chunks = join_until_size_limit(&values);
+	if values.is_empty() {
+		response.remove_cookie(cookie_name.to_string());
+	} else {
+		for (index, chunk) in chunks.iter().enumerate() {
+			let name = if index == 0 { cookie_name.to_string() } else { format!("{cookie_name}{index}") };
+			response.insert_cookie(
+				Cookie::build((name, chunk.clone()))
+					.path("/")
+					.http_only(true)
+					.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
+					.into(),
+			);
+		}
+	}
+	for index in chunks.len().max(1)..32 {
+		response.remove_cookie(format!("{cookie_name}{index}"));
+	}
+	Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::sanitize_preference;
+
+	#[test]
+	fn bounds_comment_gif_limits() {
+		assert_eq!(sanitize_preference("comment_gif_limit", "500"), "50");
+		assert_eq!(sanitize_preference("comment_gif_limit", "invalid"), "10");
+		assert_eq!(sanitize_preference("comment_gif_total_mb", "0"), "1");
+		assert_eq!(sanitize_preference("comment_gif_total_mb", "500"), "100");
+		assert_eq!(sanitize_preference("comment_gif_total_mb", "invalid"), "40");
+	}
 }

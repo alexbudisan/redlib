@@ -38,9 +38,6 @@ struct DuplicatesTemplate {
 	/// prefs are the user preferences.
 	prefs: Preferences,
 
-	/// url is the request URL.
-	url: String,
-
 	/// num_posts_filtered counts how many posts were filtered from the
 	/// duplicates list.
 	num_posts_filtered: u64,
@@ -176,7 +173,7 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 					let new_path: String = format!(
 						"{}.json?before=t3_{}&sort={}&limit=1&raw_json=1",
 						req.uri().path(),
-						&duplicates[0].id,
+						duplicates[0].id,
 						if sort.is_empty() { "num_comments".to_string() } else { sort.clone() }
 					);
 					match json(new_path, true).await {
@@ -202,7 +199,6 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 				post,
 				duplicates,
 				prefs: Preferences::new(&req),
-				url: req_url,
 				num_posts_filtered,
 				all_posts_filtered,
 			}))

@@ -120,13 +120,6 @@ async fn main() {
 		.arg(Arg::new("ipv4-only").short('4').long("ipv4-only").help("Listen on IPv4 only").num_args(0))
 		.arg(Arg::new("ipv6-only").short('6').long("ipv6-only").help("Listen on IPv6 only").num_args(0))
 		.arg(
-			Arg::new("redirect-https")
-				.short('r')
-				.long("redirect-https")
-				.help("Redirect all HTTP requests to HTTPS (no longer functional)")
-				.num_args(0),
-		)
-		.arg(
 			Arg::new("address")
 				.short('a')
 				.long("address")
@@ -220,6 +213,9 @@ async fn main() {
 
 	// Read static files
 	app.at("/style.css").get(|_| style().boxed());
+	// Put the build ID in the path, rather than only in a query string. This
+	// reliably bypasses aggressive mobile browser caches after local upgrades.
+	app.at("/style.css/:build").get(|_| style().boxed());
 	app
 		.at("/manifest.json")
 		.get(|_| resource(include_str!("../static/manifest.json"), "application/json", false).boxed());
@@ -254,6 +250,12 @@ async fn main() {
 		.at("/highlighted.js")
 		.get(|_| resource(include_str!("../static/highlighted.js"), "text/javascript", false).boxed());
 	app
+		.at("/inline-replies.js/:build")
+		.get(|_| resource(include_str!("../static/inline-replies.js"), "text/javascript", true).boxed());
+	app
+		.at("/comment-gifs.js/:build")
+		.get(|_| resource(include_str!("../static/comment-gifs.js"), "text/javascript", true).boxed());
+	app
 		.at("/check_update.js")
 		.get(|_| resource(include_str!("../static/check_update.js"), "text/javascript", false).boxed());
 	app.at("/copy.js").get(|_| resource(include_str!("../static/copy.js"), "text/javascript", false).boxed());
@@ -262,9 +264,23 @@ async fn main() {
 	app.at("/instances.json").get(|_| async move { proxy_instances().await }.boxed());
 
 	// Proxy media through Redlib
+	// Keep the legacy DASH route for existing pages while supporting both
+	// formats Reddit currently returns. Literal prefixes prevent this endpoint
+	// from becoming a generic v.redd.it path proxy.
 	app.at("/vid/:id/:size").get(|r| proxy(r, "https://v.redd.it/{id}/DASH_{size}").boxed());
+	app.at("/vid/:id/DASH/:size").get(|r| proxy(r, "https://v.redd.it/{id}/DASH_{size}").boxed());
+	app.at("/vid/:id/CMAF/:size").get(|r| proxy(r, "https://v.redd.it/{id}/CMAF_{size}").boxed());
 	app.at("/hls/:id/*path").get(|r| proxy(r, "https://v.redd.it/{id}/{path}").boxed());
 	app.at("/img/*path").get(|r| proxy(r, "https://i.redd.it/{path}").boxed());
+	app
+		.at("/comment-gif/giphy/:id")
+		.get(|r| redlib::client::proxy_bounded(r, "https://media.giphy.com/media/{id}/giphy.mp4", 8 * 1024 * 1024, "video/mp4").boxed());
+	app
+		.at("/comment-gif/imgur/:id")
+		.get(|r| redlib::client::proxy_bounded(r, "https://i.imgur.com/{id}.mp4", 8 * 1024 * 1024, "video/mp4").boxed());
+	app
+		.at("/comment-gif/reddit/*path")
+		.get(|r| redlib::client::proxy_bounded(r, "https://i.redd.it/{path}", 8 * 1024 * 1024, "image/gif").boxed());
 	app.at("/thumb/:point/:id").get(|r| proxy(r, "https://{point}.thumbs.redditmedia.com/{id}").boxed());
 	app.at("/emoji/:id/:name").get(|r| proxy(r, "https://emoji.redditmedia.com/{id}/{name}").boxed());
 	app
@@ -283,9 +299,23 @@ async fn main() {
 		.get(|r| async move { Ok(redirect(&format!("/user/{}", r.param("name").unwrap_or_default()))) }.boxed());
 	app.at("/u/:name/comments/:id/:title").get(|r| post::item(r).boxed());
 	app.at("/u/:name/comments/:id/:title/:comment_id").get(|r| post::item(r).boxed());
+	app.at("/u/:name/s/:id").get(|req: Request<Body>| {
+		Box::pin(async move {
+			let name = req.param("name").unwrap_or_default();
+			match req.param("id").as_deref() {
+				// User post share link. Resolving this performs one request only
+				// when someone explicitly opens an obfuscated share URL.
+				Some(id) if (8..12).contains(&id.len()) => match canonical_path(format!("/u/{name}/s/{id}"), 3).await {
+					Ok(Some(path)) => Ok(redirect(&path)),
+					Ok(None) => error(req, "Post ID is invalid. It may point to a post on a user that has been banned.").await,
+					Err(e) => error(req, &e).await,
+				},
+				_ => error(req, "Nothing here").await,
+			}
+		})
+	});
 
 	app.at("/user/[deleted]").get(|req| error(req, "User has deleted their account").boxed());
-	app.at("/user/:name.rss").get(|r| user::rss(r).boxed());
 	app.at("/user/:name").get(|r| user::profile(r).boxed());
 	app.at("/user/:name/:listing").get(|r| user::profile(r).boxed());
 	app.at("/user/:name/comments/:id").get(|r| post::item(r).boxed());
@@ -294,12 +324,10 @@ async fn main() {
 
 	// Configure settings
 	app.at("/settings").get(|r| settings::get(r).boxed()).post(|r| settings::set(r).boxed());
-	app.at("/settings/restore").get(|r| settings::restore(r).boxed());
+	app.at("/settings/restore").get(|r| settings::restore(r).boxed()).post(|r| settings::restore(r).boxed());
 	app.at("/settings/encoded-restore").post(|r| settings::encoded_restore(r).boxed());
+	app.at("/settings/list").post(|r| settings::update_list(r).boxed());
 	app.at("/settings/update").get(|r| settings::update(r).boxed());
-
-	// RSS Subscriptions
-	app.at("/r/:sub.rss").get(|r| subreddit::rss(r).boxed());
 
 	// Subreddit services
 	app
@@ -372,7 +400,7 @@ async fn main() {
 		Box::pin(async move {
 			let sub = req.param("sub").unwrap_or_default();
 			match req.param("id").as_deref() {
-				// Share link
+				// Subreddit post share link
 				Some(id) if (8..12).contains(&id.len()) => match canonical_path(format!("/r/{sub}/s/{id}"), 3).await {
 					Ok(Some(path)) => Ok(redirect(&path)),
 					Ok(None) => error(req, "Post ID is invalid. It may point to a post on a community that has been banned.").await,
@@ -409,7 +437,7 @@ async fn main() {
 	// Default service in case no routes match
 	app.at("/*").get(|req| error(req, "Nothing here").boxed());
 
-	println!("Running Redlib v{} on {listener}!", env!("CARGO_PKG_VERSION"));
+	println!("Running Redlib v{} build {} on {listener}!", env!("CARGO_PKG_VERSION"), env!("REDLIB_BUILD_ID"));
 
 	let server = app.listen(&listener);
 

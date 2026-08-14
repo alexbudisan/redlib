@@ -12,11 +12,12 @@ use percent_encoding::{percent_encode, CONTROLS};
 use serde_json::Value;
 use std::result::Result;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicU16};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
 use std::sync::LazyLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 use wreq::redirect::Policy;
-use wreq::{header as wreq_header, Client as WreqClient, EmulationFactory, Method, Response as WreqResponse};
-use wreq_util::{Emulation, EmulationOS, EmulationOption};
+use wreq::{header as wreq_header, Client as WreqClient, Method, Response as WreqResponse};
+use wreq_util::{Emulation, Platform, Profile};
 
 const REDDIT_URL_BASE: &str = "https://oauth.reddit.com";
 const REDDIT_URL_BASE_HOST: &str = "oauth.reddit.com";
@@ -37,6 +38,9 @@ pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
 
 pub static OAUTH_RATELIMIT_REMAINING: AtomicU16 = AtomicU16::new(99);
 
+/// Unix timestamp before which every Reddit API request should wait.
+pub static OAUTH_RATELIMIT_RESET_AT: AtomicU64 = AtomicU64::new(0);
+
 pub static OAUTH_IS_ROLLING_OVER: AtomicBool = AtomicBool::new(false);
 
 const URL_PAIRS: [(&str, &str); 2] = [
@@ -48,17 +52,15 @@ pub fn build_client() -> WreqClient {
 	// Keeping this list short to aid in privacy.
 	// The more emulations, the more unique a fingerprint each instance has.
 	// But some emulations should increase evasiveness.
-	let emulation = [Emulation::Chrome145, Emulation::Firefox147];
-	let emulation_os = [EmulationOS::Android, EmulationOS::Windows];
+	let profiles = [Profile::Chrome145, Profile::Firefox147];
+	let platforms = [Platform::Android, Platform::Windows];
 
 	let rand = fastrand::usize(..);
-	let emulation = EmulationOption::builder()
-		.emulation(emulation[rand % emulation.len()])
-		.emulation_os(emulation_os[rand % emulation_os.len()])
-		.build()
-		.emulation();
+	let profile = profiles[rand % profiles.len()];
+	let platform = platforms[rand % platforms.len()];
+	let emulation = Emulation::builder().profile(profile).platform(platform).build();
 
-	info!("Building Wreq client with random emulation {:?}", emulation);
+	info!("Building Wreq client with random emulation {profile:?} on {platform:?}");
 	WreqClient::builder()
 		.emulation(emulation)
 		.redirect(Policy::none())
@@ -209,6 +211,38 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 		.map_err(|e| e.to_string())
 }
 
+/// Proxy a fixed-format media URL only when its declared response length is
+/// known and within the supplied bound.
+pub async fn proxy_bounded(req: HyperRequest<Body>, format: &str, maximum_bytes: u64, media_type: &'static str) -> Result<HyperResponse<Body>, String> {
+	let mut url = format!("{format}?{}", req.uri().query().unwrap_or_default());
+	for (name, value) in &req.params() {
+		url = url.replace(&format!("{{{name}}}"), value);
+	}
+
+	let uri = wreq::Uri::try_from(url).map_err(|_| "Couldn't parse media URL".to_string())?;
+	let mut response = CLIENT.get(uri).header(wreq_header::ACCEPT, media_type).send().await.map_err(|error| error.to_string())?;
+
+	let content_type = response.headers().get(wreq_header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).unwrap_or_default();
+	if !content_type.starts_with(media_type) {
+		return Err("Unsupported comment media type".to_string());
+	}
+
+	let content_length = response
+		.headers()
+		.get(wreq_header::CONTENT_LENGTH)
+		.and_then(|value| value.to_str().ok())
+		.and_then(|value| value.parse::<u64>().ok())
+		.ok_or_else(|| "Comment media size is unknown".to_string())?;
+	if content_length > maximum_bytes {
+		return Err("Comment media exceeds the configured size limit".to_string());
+	}
+
+	response
+		.headers_mut()
+		.insert(wreq_header::CACHE_CONTROL, wreq_header::HeaderValue::from_static("public, max-age=86400"));
+	Ok(response.into_hyper_response())
+}
+
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
 /// 3xx codes Reddit returns and will automatically redirect.
 fn reddit_get(path: String, quarantine: bool) -> Boxed<Result<WreqResponse, String>> {
@@ -318,57 +352,100 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 	.boxed()
 }
 
-/// Make a request to a Reddit API and parse the JSON response
-#[cached(size = 100, time = 30, result = true)]
+fn is_metadata_path(path: &str) -> bool {
+	path.split('?').next().is_some_and(|path| path.ends_with("/about.json"))
+}
+
+/// Cache slowly changing metadata longer than listings and content. Per-key
+/// synchronization ensures concurrent misses produce one upstream request.
 pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
+	if is_metadata_path(&path) {
+		json_metadata(path, quarantine).await
+	} else {
+		json_content(path, quarantine).await
+	}
+}
+
+#[cached(size = 256, time = 300, result = true, sync_writes = "by_key")]
+async fn json_metadata(path: String, quarantine: bool) -> Result<Value, String> {
+	fetch_json(path, quarantine).await
+}
+
+#[cached(size = 256, time = 30, result = true, sync_writes = "by_key")]
+async fn json_content(path: String, quarantine: bool) -> Result<Value, String> {
+	fetch_json(path, quarantine).await
+}
+
+fn unix_timestamp() -> u64 {
+	SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+async fn wait_for_rate_limit_cooldown() {
+	loop {
+		let wait = OAUTH_RATELIMIT_RESET_AT.load(Ordering::SeqCst).saturating_sub(unix_timestamp());
+		if wait == 0 {
+			return;
+		}
+		tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+	}
+}
+
+fn update_rate_limit(remaining: &str, reset: &str) {
+	let Ok(remaining) = remaining.parse::<f32>() else { return };
+	let remaining = remaining.max(0.0).round() as u16;
+	OAUTH_RATELIMIT_REMAINING.store(remaining, Ordering::SeqCst);
+
+	if remaining < 10 {
+		let reset_seconds = reset.parse::<f64>().unwrap_or_default().max(0.0).ceil() as u64;
+		if reset_seconds > 0 {
+			OAUTH_RATELIMIT_RESET_AT.fetch_max(unix_timestamp().saturating_add(reset_seconds), Ordering::SeqCst);
+			warn!("Reddit rate limit is low ({remaining}); pausing API requests for up to {reset_seconds}s");
+		}
+	}
+}
+
+/// Make an uncached request to the Reddit API and parse the JSON response.
+async fn fetch_json(path: String, quarantine: bool) -> Result<Value, String> {
 	// Closure to quickly build errors
 	let err = |msg: &str, e: String, path: String| -> Result<Value, String> {
 		// eprintln!("{} - {}: {}", url, msg, e);
 		Err(format!("{msg}: {e} | {path}"))
 	};
 
-	// First, handle rolling over the OAUTH_CLIENT if need be.
+	wait_for_rate_limit_cooldown().await;
+
 	let current_rate_limit = OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst);
-	let is_rolling_over = OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst);
-	if current_rate_limit < 10 && !is_rolling_over {
-		warn!("Rate limit {current_rate_limit} is low. Spawning force_refresh_token()");
-		tokio::spawn(force_refresh_token());
-	}
-	OAUTH_RATELIMIT_REMAINING.fetch_sub(1, Ordering::SeqCst);
+	let _ = OAUTH_RATELIMIT_REMAINING.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| Some(remaining.saturating_sub(1)));
 
 	// Fetch the url...
 	match reddit_get(path.clone(), quarantine).await {
 		Ok(response) => {
 			let status = response.status();
 
-			let reset: Option<String> = if let (Some(remaining), Some(reset), Some(used)) = (
-				response.headers().get("x-ratelimit-remaining").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
-				response.headers().get("x-ratelimit-reset").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
-				response.headers().get("x-ratelimit-used").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
-			) {
+			let header = |name| response.headers().get(name).and_then(|value| value.to_str().ok()).map(str::to_owned);
+			let remaining = header("x-ratelimit-remaining");
+			let reset = header("x-ratelimit-reset").or_else(|| header("retry-after"));
+			let used = header("x-ratelimit-used");
+			if let (Some(remaining), Some(reset)) = (&remaining, &reset) {
 				trace!(
-					"Ratelimit remaining: Header says {remaining}, we have {current_rate_limit}. Resets in {reset}. Rollover: {}. Ratelimit used: {used}",
-					if is_rolling_over { "yes" } else { "no" },
+					"Reddit rate limit: remaining={remaining}, previous={current_rate_limit}, reset={reset}s, used={}",
+					used.as_deref().unwrap_or("unknown")
 				);
-
-				// If can parse remaining as a float, round to a u16 and save
-				if let Ok(val) = remaining.parse::<f32>() {
-					OAUTH_RATELIMIT_REMAINING.store(val.round() as u16, Ordering::SeqCst);
-				}
-
-				Some(reset)
-			} else {
-				None
-			};
+				update_rate_limit(remaining, reset);
+			}
+			if status.as_u16() == 429 {
+				let reset_seconds = reset.as_deref().and_then(|value| value.parse::<f64>().ok()).unwrap_or(60.0).max(1.0).ceil() as u64;
+				OAUTH_RATELIMIT_REMAINING.store(0, Ordering::SeqCst);
+				OAUTH_RATELIMIT_RESET_AT.fetch_max(unix_timestamp().saturating_add(reset_seconds), Ordering::SeqCst);
+				warn!("Reddit returned 429; pausing API requests for {reset_seconds}s");
+			}
 
 			// asynchronously aggregate the chunks of the body
 			match hyper::body::aggregate(response.into_hyper_response()).await {
 				Ok(body) => {
 					let has_remaining = body.has_remaining();
 
-					if !has_remaining {
-						// Rate limited, so spawn a force_refresh_token()
-						tokio::spawn(force_refresh_token());
+					if !has_remaining || status.as_u16() == 429 {
 						return match reset {
 							Some(val) => Err(format!(
 								"Reddit rate limit exceeded. Try refreshing in a few seconds.\
@@ -510,6 +587,14 @@ mod tests {
 	use {crate::config::get_setting, sealed_test::prelude::*};
 
 	const POPULAR_URL: &str = "/r/popular/hot.json?&raw_json=1&geo_filter=GLOBAL";
+
+	#[test]
+	fn classifies_cache_lifetimes_by_endpoint() {
+		assert!(is_metadata_path("/r/rust/about.json?raw_json=1"));
+		assert!(is_metadata_path("/user/example/about.json?raw_json=1"));
+		assert!(!is_metadata_path(POPULAR_URL));
+		assert!(!is_metadata_path("/comments/example.json?raw_json=1"));
+	}
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_rate_limit_check() {

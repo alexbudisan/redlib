@@ -5,10 +5,6 @@ use std::{env::var, fs::read_to_string, sync::LazyLock};
 /// first request) and contains the instance settings.
 pub static CONFIG: LazyLock<Config> = LazyLock::new(Config::load);
 
-/// This serves as the frontend for an archival API - on removed comments, this URL
-/// will be the base of a link, to display removed content (on another site).
-pub const DEFAULT_PUSHSHIFT_FRONTEND: &str = "undelete.pullpush.io";
-
 /// Stores the configuration parsed from the environment variables and the
 /// config file. `Config::Default()` contains None for each setting.
 /// When adding more config settings, add it to `Config::load`,
@@ -96,16 +92,6 @@ pub struct Config {
 	#[serde(alias = "LIBREDDIT_ROBOTS_DISABLE_INDEXING")]
 	pub(crate) robots_disable_indexing: Option<String>,
 
-	#[serde(rename = "REDLIB_PUSHSHIFT_FRONTEND")]
-	#[serde(alias = "LIBREDDIT_PUSHSHIFT_FRONTEND")]
-	pub(crate) pushshift: Option<String>,
-
-	#[serde(rename = "REDLIB_ENABLE_RSS")]
-	pub(crate) enable_rss: Option<String>,
-
-	#[serde(rename = "REDLIB_FULL_URL")]
-	pub(crate) full_url: Option<String>,
-
 	#[serde(rename = "REDLIB_DEFAULT_REMOVE_DEFAULT_FEEDS")]
 	pub(crate) default_remove_default_feeds: Option<String>,
 }
@@ -152,9 +138,6 @@ impl Config {
 			default_disable_visit_reddit_confirmation: parse("REDLIB_DEFAULT_DISABLE_VISIT_REDDIT_CONFIRMATION"),
 			banner: parse("REDLIB_BANNER"),
 			robots_disable_indexing: parse("REDLIB_ROBOTS_DISABLE_INDEXING"),
-			pushshift: parse("REDLIB_PUSHSHIFT_FRONTEND"),
-			enable_rss: parse("REDLIB_ENABLE_RSS"),
-			full_url: parse("REDLIB_FULL_URL"),
 			default_remove_default_feeds: parse("REDLIB_DEFAULT_REMOVE_DEFAULT_FEEDS"),
 		}
 	}
@@ -182,9 +165,6 @@ fn get_setting_from_config(name: &str, config: &Config) -> Option<String> {
 		"REDLIB_DEFAULT_DISABLE_VISIT_REDDIT_CONFIRMATION" => config.default_disable_visit_reddit_confirmation.clone(),
 		"REDLIB_BANNER" => config.banner.clone(),
 		"REDLIB_ROBOTS_DISABLE_INDEXING" => config.robots_disable_indexing.clone(),
-		"REDLIB_PUSHSHIFT_FRONTEND" => config.pushshift.clone(),
-		"REDLIB_ENABLE_RSS" => config.enable_rss.clone(),
-		"REDLIB_FULL_URL" => config.full_url.clone(),
 		"REDLIB_DEFAULT_REMOVE_DEFAULT_FEEDS" => config.default_remove_default_feeds.clone(),
 		_ => None,
 	}
@@ -261,14 +241,5 @@ mod tests {
 	#[sealed_test(env = [("REDLIB_DEFAULT_FILTERS", "news+bestof")])]
 	fn test_default_filters() {
 		assert_eq!(get_setting("REDLIB_DEFAULT_FILTERS"), Some("news+bestof".into()));
-	}
-
-	#[test]
-	#[sealed_test]
-	fn test_pushshift() {
-		let config_to_write = r#"REDLIB_PUSHSHIFT_FRONTEND = "https://api.pushshift.io""#;
-		write("redlib.toml", config_to_write).unwrap();
-		assert!(get_setting("REDLIB_PUSHSHIFT_FRONTEND").is_some());
-		assert_eq!(get_setting("REDLIB_PUSHSHIFT_FRONTEND"), Some("https://api.pushshift.io".into()));
 	}
 }

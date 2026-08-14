@@ -1,11 +1,9 @@
 #![allow(clippy::cmp_owned)]
 use crate::client::json;
 use crate::server::RequestExt;
-use crate::utils::{error, filter_posts, format_url, get_filters, nsfw_landing, param, setting, template, Post, Preferences, User};
-use crate::{config, utils};
+use crate::utils;
+use crate::utils::{error, filter_posts, format_num, format_url, get_filters, nsfw_landing, param, setting, template, Post, Preferences, User};
 use askama::Template;
-use chrono::DateTime;
-use htmlescape::decode_html;
 use hyper::{Body, Request, Response};
 use time::{macros::format_description, OffsetDateTime};
 
@@ -30,6 +28,8 @@ struct UserTemplate {
 	/// Whether all posts were hidden because they are NSFW (and user has disabled show NSFW)
 	all_posts_hidden_nsfw: bool,
 	no_posts: bool,
+	metadata_error: bool,
+	karma: (String, String),
 }
 
 // FUNCTIONS
@@ -50,7 +50,19 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 	let username = req.param("name").unwrap_or_default();
 
 	// Retrieve info from user about page.
-	let user = user(&username).await.unwrap_or_default();
+	let (user, metadata_error) = match user(&username).await {
+		Ok(user) => (user, false),
+		Err(message) if message == "suspended" => return error(req, &format!("u/{username} is suspended")).await,
+		Err(message) if message == "User not found" => return error(req, &format!("u/{username} does not exist or has been deleted")).await,
+		Err(_) => (
+			User {
+				name: username.clone(),
+				..User::default()
+			},
+			true,
+		),
+	};
+	let karma = format_num(user.karma);
 
 	let req_url = req.uri().to_string();
 	// Return landing page if this post if this Reddit deems this user NSFW,
@@ -61,7 +73,10 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 	}
 
 	let filters = get_filters(&req);
-	if filters.contains(&["u_", &username].concat()) {
+	if filters.iter().any(|filter| {
+		filter.strip_prefix("u_").is_some_and(|name| name.eq_ignore_ascii_case(&username))
+			|| filter.strip_prefix("author:").is_some_and(|name| name.eq_ignore_ascii_case(&username))
+	}) {
 		Ok(template(&UserTemplate {
 			user,
 			posts: Vec::new(),
@@ -75,12 +90,17 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
+			metadata_error,
+			karma,
 		}))
 	} else {
 		// Request user posts/comments from Reddit
 		match Post::fetch(&path, false).await {
 			Ok((mut posts, after)) => {
 				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
+				if sort == "new" {
+					posts.sort_by_key(|post| std::cmp::Reverse(post.created_ts));
+				}
 				let no_posts = posts.is_empty();
 				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 				Ok(template(&UserTemplate {
@@ -96,6 +116,8 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 					all_posts_filtered,
 					all_posts_hidden_nsfw,
 					no_posts,
+					metadata_error,
+					karma,
 				}))
 			}
 			// If there is an error show error page
@@ -110,7 +132,11 @@ async fn user(name: &str) -> Result<User, String> {
 	let path: String = format!("/user/{name}/about.json?raw_json=1");
 
 	// Send a request to the url
-	json(path, false).await.map(|res| {
+	let res = json(path, false).await?;
+	if !res["data"].is_object() {
+		return Err("User not found".to_string());
+	}
+	Ok({
 		// Grab creation date as unix timestamp
 		let created_unix = res["data"]["created"].as_f64().unwrap_or(0.0).round() as i64;
 		let created = OffsetDateTime::from_unix_timestamp(created_unix).unwrap_or(OffsetDateTime::UNIX_EPOCH);
@@ -125,62 +151,11 @@ async fn user(name: &str) -> Result<User, String> {
 			icon: format_url(&about("icon_img")),
 			karma: res["data"]["total_karma"].as_i64().unwrap_or(0),
 			created: created.format(format_description!("[month repr:short] [day] '[year repr:last_two]")).unwrap_or_default(),
-			banner: about("banner_img"),
+			banner: format_url(&about("banner_img")),
 			description: about("public_description"),
 			nsfw: res["data"]["subreddit"]["over_18"].as_bool().unwrap_or_default(),
 		}
 	})
-}
-
-pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
-	if config::get_setting("REDLIB_ENABLE_RSS").is_none() {
-		return Ok(error(req, "RSS is disabled on this instance.").await.unwrap_or_default());
-	}
-	use crate::utils::rewrite_urls;
-	use hyper::header::CONTENT_TYPE;
-	use rss::{ChannelBuilder, Item};
-
-	// Get user
-	let user_str = req.param("name").unwrap_or_default();
-
-	let listing = req.param("listing").unwrap_or_else(|| "overview".to_string());
-
-	// Get path
-	let path = format!("/user/{user_str}/{listing}.json?{}&raw_json=1", req.uri().query().unwrap_or_default(),);
-
-	// Get user
-	let user_obj = user(&user_str).await.unwrap_or_default();
-
-	// Get posts
-	let (posts, _) = Post::fetch(&path, false).await?;
-
-	// Build the RSS feed
-	let channel = ChannelBuilder::default()
-		.title(user_str)
-		.description(user_obj.description)
-		.items(
-			posts
-				.into_iter()
-				.map(|post| Item {
-					title: Some(post.title.to_string()),
-					link: Some(format_url(&utils::get_post_url(&post))),
-					author: Some(post.author.name),
-					pub_date: Some(DateTime::from_timestamp(post.created_ts as i64, 0).unwrap_or_default().to_rfc2822()),
-					content: Some(rewrite_urls(&decode_html(&post.body).unwrap_or_else(|_| post.body.clone()))),
-					..Default::default()
-				})
-				.collect::<Vec<_>>(),
-		)
-		.build();
-
-	// Serialize the feed to RSS
-	let body = channel.to_string().into_bytes();
-
-	// Create the HTTP response
-	let mut res = Response::new(Body::from(body));
-	res.headers_mut().insert(CONTENT_TYPE, hyper::header::HeaderValue::from_static("application/rss+xml"));
-
-	Ok(res)
 }
 
 #[cfg(test)]

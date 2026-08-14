@@ -19,6 +19,7 @@
 	<main>
 		{% if !is_filtered %}
 		<div id="column_one">
+			{% if metadata_error %}<p class="listing_warn">Community information is temporarily unavailable; posts may still be browsed below.</p>{% endif %}
 			<form id="sort">
 				<div id="sort_options">
 					{% if sub.name.is_empty() %}
@@ -130,13 +131,6 @@
 							</form>
 							{% endif %}
 						</div>
-						{% if crate::utils::enable_rss() %}
-						<div id="sub_rss">
-                            <a href="/r/{{ sub.name }}.rss" title="RSS feed for r/{{ sub.name }}">
-                                <button class="subscribe">RSS feed</button >
-                            </a>
-						</div>
-						{% endif %}
 				</div>
 			</details>
 			<details class="panel" id="sidebar">

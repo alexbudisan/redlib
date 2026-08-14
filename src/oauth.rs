@@ -88,7 +88,7 @@ impl Oauth {
 						match e {
 							AuthError::Wreq(error) => error.to_string(),
 							AuthError::SerdeDeserialize(error) => error.to_string(),
-							AuthError::Field((value, error)) => format!("{error}\n{value}"),
+							AuthError::Field(error) => error.to_string(),
 						}
 					);
 				}
@@ -142,7 +142,7 @@ impl Oauth {
 enum AuthError {
 	Wreq(wreq::Error),
 	SerdeDeserialize(serde_json::Error),
-	Field((serde_json::Value, &'static str)),
+	Field(&'static str),
 }
 
 impl From<wreq::Error> for AuthError {
@@ -163,8 +163,9 @@ pub async fn token_daemon() {
 		// Get expiry time - be sure to not hold the read lock
 		let expires_in = { OAUTH_CLIENT.load_full().expires_in };
 
-		// sleep for the expiry time minus 2 minutes
-		let duration = Duration::from_secs(expires_in - 120);
+		// Refresh two minutes early without underflowing malformed or unusually
+		// short expiry values.
+		let duration = token_refresh_delay(expires_in);
 
 		info!("[⏳] Waiting for {duration:?} seconds before refreshing OAuth token...");
 
@@ -177,6 +178,10 @@ pub async fn token_daemon() {
 			force_refresh_token().await;
 		}
 	}
+}
+
+fn token_refresh_delay(expires_in: u64) -> Duration {
+	Duration::from_secs(expires_in.saturating_sub(120).max(1))
 }
 
 pub async fn force_refresh_token() {
@@ -244,7 +249,6 @@ impl OauthBackend for MobileSpoofAuth {
 		let resp = builder.json(&json).send().await?;
 
 		trace!("Received response with status {} and length {:?}", resp.status(), resp.headers().get("content-length"));
-		trace!("OAuth headers: {:#?}", resp.headers());
 
 		// Parse headers - loid header _should_ be saved sent on subsequent token refreshes.
 		// Technically it's not needed, but it's easy for Reddit API to check for this.
@@ -253,13 +257,17 @@ impl OauthBackend for MobileSpoofAuth {
 		// and really only as privacy-concerning as the OAuth token itself.
 		if let Some(header) = resp.headers().get("x-reddit-loid") {
 			let header_val: &wreq::header::HeaderValue = header;
-			self.additional_headers.insert("x-reddit-loid".to_owned(), header_val.to_str().unwrap().to_string());
+			if let Ok(value) = header_val.to_str() {
+				self.additional_headers.insert("x-reddit-loid".to_owned(), value.to_owned());
+			}
 		}
 
 		// Same with x-reddit-session
 		if let Some(header) = resp.headers().get("x-reddit-session") {
 			let header_val: &wreq::header::HeaderValue = header;
-			self.additional_headers.insert("x-reddit-session".to_owned(), header_val.to_str().unwrap().to_string());
+			if let Ok(value) = header_val.to_str() {
+				self.additional_headers.insert("x-reddit-session".to_owned(), value.to_owned());
+			}
 		}
 
 		trace!("Serializing response...");
@@ -272,17 +280,17 @@ impl OauthBackend for MobileSpoofAuth {
 		// Save token and expiry
 		let token = json
 			.get("access_token")
-			.ok_or_else(|| AuthError::Field((json.clone(), "access_token")))?
+			.ok_or(AuthError::Field("OAuth response is missing access_token"))?
 			.as_str()
-			.ok_or_else(|| AuthError::Field((json.clone(), "access_token: as_str")))?
+			.ok_or(AuthError::Field("OAuth access_token has an invalid type"))?
 			.to_string();
 		let expires_in = json
 			.get("expires_in")
-			.ok_or_else(|| AuthError::Field((json.clone(), "expires_in")))?
+			.ok_or(AuthError::Field("OAuth response is missing expires_in"))?
 			.as_u64()
-			.ok_or_else(|| AuthError::Field((json.clone(), "expires_in: as_u64")))?;
+			.ok_or(AuthError::Field("OAuth expires_in has an invalid type"))?;
 
-		info!("[✅] Success - Retrieved token \"{}...\", expires in {}", &token[..32], expires_in);
+		info!("[✅] Successfully retrieved OAuth token; expires in {expires_in}s");
 
 		Ok(OauthResponse {
 			token,
@@ -321,7 +329,7 @@ impl GenericWebAuth {
 			})
 			.collect();
 
-		info!("[🔄] Using GenericWebAuth with device_id: \"{device_id}\"");
+		info!("[🔄] Using GenericWebAuth");
 
 		Self {
 			device_id,
@@ -357,7 +365,6 @@ impl OauthBackend for GenericWebAuth {
 		let resp: wreq::Response = builder.body(body_str).send().await?;
 
 		trace!("Received response with status {} and length {:?}", resp.status(), resp.headers().get("content-length"));
-		trace!("GenericWebAuth headers: {:#?}", resp.headers());
 
 		// Parse headers - loid header _should_ be saved sent on subsequent token refreshes.
 		// Technically it's not needed, but it's easy for Reddit API to check for this.
@@ -366,13 +373,17 @@ impl OauthBackend for GenericWebAuth {
 		// and really only as privacy-concerning as the OAuth token itself.
 		if let Some(header) = resp.headers().get("x-reddit-loid") {
 			let header_val: &wreq::header::HeaderValue = header;
-			self.additional_headers.insert("x-reddit-loid".to_owned(), header_val.to_str().unwrap().to_string());
+			if let Ok(value) = header_val.to_str() {
+				self.additional_headers.insert("x-reddit-loid".to_owned(), value.to_owned());
+			}
 		}
 
 		// Same with x-reddit-session
 		if let Some(header) = resp.headers().get("x-reddit-session") {
 			let header_val: &wreq::header::HeaderValue = header;
-			self.additional_headers.insert("x-reddit-session".to_owned(), header_val.to_str().unwrap().to_string());
+			if let Ok(value) = header_val.to_str() {
+				self.additional_headers.insert("x-reddit-session".to_owned(), value.to_owned());
+			}
 		}
 
 		trace!("Serializing GenericWebAuth response...");
@@ -385,21 +396,17 @@ impl OauthBackend for GenericWebAuth {
 		// Parse response - access_token, token_type, device_id, expires_in, scope
 		let token = json
 			.get("access_token")
-			.ok_or_else(|| AuthError::Field((json.clone(), "access_token")))?
+			.ok_or(AuthError::Field("OAuth response is missing access_token"))?
 			.as_str()
-			.ok_or_else(|| AuthError::Field((json.clone(), "access_token: as_str")))?
+			.ok_or(AuthError::Field("OAuth access_token has an invalid type"))?
 			.to_string();
 		let expires_in = json
 			.get("expires_in")
-			.ok_or_else(|| AuthError::Field((json.clone(), "expires_in")))?
+			.ok_or(AuthError::Field("OAuth response is missing expires_in"))?
 			.as_u64()
-			.ok_or_else(|| AuthError::Field((json.clone(), "expires_in: as_u64")))?;
+			.ok_or(AuthError::Field("OAuth expires_in has an invalid type"))?;
 
-		info!(
-			"[✅] GenericWebAuth success - Retrieved token \"{}...\", expires in {}",
-			&token[..32.min(token.len())],
-			expires_in
-		);
+		info!("[✅] GenericWebAuth successfully retrieved OAuth token; expires in {expires_in}s");
 
 		// Insert a few necessary headers
 		self.additional_headers.insert("Origin".to_owned(), "https://www.reddit.com".to_owned());
@@ -450,7 +457,7 @@ impl Device {
 			("X-Reddit-Device-Id".into(), uuid.clone()),
 		]);
 
-		info!("[🔄] Spoofing Android client with headers: {headers:?}, uuid: \"{uuid}\", and OAuth ID \"{REDDIT_ANDROID_OAUTH_CLIENT_ID}\"");
+		info!("[🔄] Created randomized Android client identity");
 
 		Self {
 			oauth_id: REDDIT_ANDROID_OAUTH_CLIENT_ID.to_string(),
@@ -472,6 +479,13 @@ fn choose<T: Copy>(list: &[T]) -> T {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn refresh_delay_never_underflows() {
+		assert_eq!(token_refresh_delay(0), Duration::from_secs(1));
+		assert_eq!(token_refresh_delay(60), Duration::from_secs(1));
+		assert_eq!(token_refresh_delay(3600), Duration::from_secs(3480));
+	}
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_mobile_spoof_backend() {

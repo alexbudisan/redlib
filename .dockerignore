@@ -1,3 +1,7 @@
 target
 .github
+.git
 Dockerfile*
+*.tar
+*.tar.gz
+*.tgz
