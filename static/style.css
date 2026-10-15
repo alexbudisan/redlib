@@ -1556,6 +1556,24 @@ a.search_subreddit:hover {
     margin: 2px 0 4px 15px;
 }
 
+.continue_thread {
+    display: block;
+    color: var(--accent);
+    margin: 2px 0 4px 15px;
+}
+
+.thread_cut > .comment_right > .replies,
+.thread_focused .thread {
+    display: none;
+}
+
+.thread_focus_back {
+    display: inline-block;
+    color: var(--accent);
+    font-weight: bold;
+    margin: 10px 0;
+}
+
 .deeper_replies[aria-busy="true"] {
     cursor: progress;
     opacity: 0.65;
@@ -1592,27 +1610,33 @@ a.search_subreddit:hover {
     background: var(--foreground);
 }
 
-/* Theme-aware thread guides. Use established theme colors rather than newer
-   color functions so this remains reliable in Safari on iOS and macOS. */
+/* Thread guides cycle through four muted hues so neighbouring nesting levels
+   are easy to tell apart. Mid-lightness colours read on both dark and light
+   themes; plain hex keeps this reliable in Safari on iOS and macOS. Selectors
+   cover 12 levels, beyond which the last colour simply repeats. */
+:root {
+    --thread-line-1: #6c8ebf;
+    --thread-line-2: #6aa77d;
+    --thread-line-3: #c9a04e;
+    --thread-line-4: #a07cc5;
+}
+
 .replies > .comment > .comment_left .line {
-    background: var(--accent);
-    opacity: 0.38;
+    opacity: 0.75;
 }
 
-.replies .replies > .comment > .comment_left .line {
-    background: var(--visited);
-    opacity: 0.52;
-}
-
-.replies .replies .replies > .comment > .comment_left .line {
-    background: var(--text);
-    opacity: 0.3;
-}
-
-.replies .replies .replies .replies > .comment > .comment_left .line {
-    background: var(--accent);
-    opacity: 0.55;
-}
+.replies > .comment > .comment_left .line { background: var(--thread-line-1); }
+.replies .replies > .comment > .comment_left .line { background: var(--thread-line-2); }
+.replies .replies .replies > .comment > .comment_left .line { background: var(--thread-line-3); }
+.replies .replies .replies .replies > .comment > .comment_left .line { background: var(--thread-line-4); }
+.replies .replies .replies .replies .replies > .comment > .comment_left .line { background: var(--thread-line-1); }
+.replies .replies .replies .replies .replies .replies > .comment > .comment_left .line { background: var(--thread-line-2); }
+.replies .replies .replies .replies .replies .replies .replies > .comment > .comment_left .line { background: var(--thread-line-3); }
+.replies .replies .replies .replies .replies .replies .replies .replies > .comment > .comment_left .line { background: var(--thread-line-4); }
+.replies .replies .replies .replies .replies .replies .replies .replies .replies > .comment > .comment_left .line { background: var(--thread-line-1); }
+.replies .replies .replies .replies .replies .replies .replies .replies .replies .replies > .comment > .comment_left .line { background: var(--thread-line-2); }
+.replies .replies .replies .replies .replies .replies .replies .replies .replies .replies .replies > .comment > .comment_left .line { background: var(--thread-line-3); }
+.replies .replies .replies .replies .replies .replies .replies .replies .replies .replies .replies .replies > .comment > .comment_left .line { background: var(--thread-line-4); }
 
 summary.comment_data {
     cursor: pointer;
@@ -2148,6 +2172,21 @@ th {
         width: 100%;
         height: auto;
     }
+
+    /* Without this, the 512px height cap shrinks portrait images to well
+       under the card width. */
+    .post_media_image.short svg,
+    .post_media_image.short img {
+        max-height: none;
+    }
+
+    /* Images posted in comments and self-text fill the text column. */
+    .comment_body figure img,
+    .post_body figure img {
+        width: 100%;
+        max-width: 100%;
+        height: auto;
+    }
 }
 
 @media screen and (max-width: 580px) {
@@ -2198,8 +2237,10 @@ th {
         margin-left: 15px;
     }
 
+    /* 10px of indentation per nesting level (30px left column + 2px
+       padding - 22px). */
     .replies > .comment {
-        margin: 2px 0 2px -18px;
+        margin: 2px 0 2px -22px;
         padding: 2px 0;
     }
 
