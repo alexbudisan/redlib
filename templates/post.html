@@ -2,7 +2,7 @@
 {% import "utils.html" as utils %}
 
 {% block title %}
-	{% if single_thread %}
+	{% if single_thread && comments.len() > 0 %}
 		{{ comments[0].author.name }} comments on {{ post.title }} - r/{{ post.community }}
 	{% else %}
 		{{ post.title }} - r/{{ post.community }}
@@ -42,9 +42,6 @@
 	{% endif %}
 	{% endif %}
 	<script src="/inline-replies.js/{{ env!("REDLIB_BUILD_ID") }}" defer></script>
-	{% if prefs.embed_comment_gifs == "on" %}
-	<script src="/comment-gifs.js/{{ env!("REDLIB_BUILD_ID") }}" data-avoid-metered="{{ prefs.disable_gifs_on_metered }}" data-maximum-previews="{{ prefs.comment_gif_limit }}" data-maximum-megabytes="{{ prefs.comment_gif_total_mb }}" defer></script>
-	{% endif %}
 {% endblock %}
 
 {% block subscriptions %}

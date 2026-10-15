@@ -290,6 +290,8 @@ impl Media {
 #[derive(Serialize)]
 pub struct GalleryMedia {
 	pub url: String,
+	pub fallback_url: String,
+	pub is_video: bool,
 	pub width: i64,
 	pub height: i64,
 	pub caption: String,
@@ -308,15 +310,27 @@ impl GalleryMedia {
 				let image = &metadata[media_id]["s"];
 				let image_type = &metadata[media_id]["m"];
 
-				let url = if image_type == "image/gif" {
-					image["gif"].as_str().unwrap_or_default()
+				let ordinary_url = image["u"].as_str().unwrap_or_default();
+				let gif_url = image["gif"].as_str().filter(|url| !url.is_empty()).unwrap_or(ordinary_url);
+				let mp4_url = image["mp4"].as_str().filter(|url| !url.is_empty());
+				// Reddit usually supplies an MP4 rendition for animated gallery
+				// entries. Prefer it because Safari handles video substantially more
+				// reliably and efficiently than large animated GIFs. If any rendition
+				// is absent, fall back without issuing another backend request.
+				let (url, fallback_url, is_video) = if image_type == "image/gif" {
+					match mp4_url {
+						Some(url) => (url, gif_url, true),
+						None => (gif_url, ordinary_url, false),
+					}
 				} else {
-					image["u"].as_str().unwrap_or_default()
+					(ordinary_url, ordinary_url, false)
 				};
 
 				// Construct gallery items
 				Self {
 					url: format_url(url),
+					fallback_url: format_url(fallback_url),
+					is_video,
 					width: image["x"].as_i64().unwrap_or_default(),
 					height: image["y"].as_i64().unwrap_or_default(),
 					caption: item["caption"].as_str().unwrap_or_default().to_string(),
@@ -675,6 +689,7 @@ pub struct Preferences {
 	pub remove_default_feeds: String,
 	#[revision(start = 2)]
 	#[serde(skip_serializing, skip_deserializing)]
+	/// Retained only so revision-2 exported preferences remain decodable.
 	pub embed_comment_gifs: String,
 	#[revision(start = 2)]
 	#[serde(skip_serializing, skip_deserializing)]
@@ -743,10 +758,10 @@ impl Preferences {
 			hide_awards: setting(req, "hide_awards"),
 			hide_score: setting(req, "hide_score"),
 			remove_default_feeds: setting(req, "remove_default_feeds"),
-			embed_comment_gifs: setting(req, "embed_comment_gifs"),
-			disable_gifs_on_metered: setting_or_default(req, "disable_gifs_on_metered", "on".to_string()),
-			comment_gif_limit: setting_or_default(req, "comment_gif_limit", "10".to_string()),
-			comment_gif_total_mb: setting_or_default(req, "comment_gif_total_mb", "40".to_string()),
+			embed_comment_gifs: String::new(),
+			disable_gifs_on_metered: String::new(),
+			comment_gif_limit: String::new(),
+			comment_gif_total_mb: String::new(),
 		}
 	}
 
@@ -1125,61 +1140,6 @@ static REDDIT_PREVIEW_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"htt
 static REDDIT_EMOJI_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://(www|).redditstatic\.com/(.*)").unwrap());
 static REDLIB_PREVIEW_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/(img|preview/)(pre|external-pre)?/(.*?)>"#).unwrap());
 static REDLIB_PREVIEW_TEXT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r">(.*?)</a>").unwrap());
-static GIPHY_PAGE_COMMENT_LINK_REGEX: LazyLock<Regex> =
-	LazyLock::new(|| Regex::new(r#"<a href="(https?://(?:www\.)?giphy\.com/(?:gifs|clips)/([^"?#]+)(?:[?#][^"]*)?)">([^<]*)</a>"#).unwrap());
-static GIPHY_MEDIA_COMMENT_LINK_REGEX: LazyLock<Regex> =
-	LazyLock::new(|| Regex::new(r#"<a href="(https?://media\.giphy\.com/media/([A-Za-z0-9]+)(?:/[^"?#]*)?(?:[?#][^"]*)?)">([^<]*)</a>"#).unwrap());
-static GIPHY_IMAGE_COMMENT_LINK_REGEX: LazyLock<Regex> =
-	LazyLock::new(|| Regex::new(r#"<a href="(https?://i\.giphy\.com/(?:media/)?([A-Za-z0-9]+)(?:/[^"?#]*)?(?:\.[A-Za-z0-9]+)?(?:[?#][^"]*)?)">([^<]*)</a>"#).unwrap());
-static IMGUR_COMMENT_LINK_REGEX: LazyLock<Regex> =
-	LazyLock::new(|| Regex::new(r#"<a href="(https://i\.imgur\.com/([A-Za-z0-9]+)\.(?:gifv?|mp4)(?:\?[^"]*)?)">([^<]*)</a>"#).unwrap());
-static REDDIT_COMMENT_GIF_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<a href="(/img/([^"?#]+\.gif)(?:\?[^"]*)?)">([^<]*)</a>"#).unwrap());
-
-/// Convert a deliberately small allowlist of comment GIF links into lazy,
-/// muted video previews. The original URL remains the enclosing destination.
-pub fn embed_comment_gifs(input: &str) -> String {
-	let render_giphy = |source: &str, id: &str, original: &str| {
-		if id.is_empty() || !id.chars().all(|character| character.is_ascii_alphanumeric()) {
-			return original.to_string();
-		}
-		format!(
-			r#"<a class="comment_gif_source" href="{source}"><video class="comment_gif" data-src="/comment-gif/giphy/{id}" muted loop autoplay playsinline preload="none"></video><span class="comment_gif_label">GIF — tap for source</span></a>"#
-		)
-	};
-
-	let with_giphy_pages = GIPHY_PAGE_COMMENT_LINK_REGEX
-		.replace_all(input, |caps: &regex::Captures<'_>| {
-			let slug = &caps[2];
-			let id = slug.rsplit('-').next().unwrap_or(slug);
-			render_giphy(&caps[1], id, &caps[0])
-		})
-		.to_string();
-	let with_giphy_media = GIPHY_MEDIA_COMMENT_LINK_REGEX
-		.replace_all(&with_giphy_pages, |caps: &regex::Captures<'_>| render_giphy(&caps[1], &caps[2], &caps[0]))
-		.to_string();
-	let with_giphy = GIPHY_IMAGE_COMMENT_LINK_REGEX
-		.replace_all(&with_giphy_media, |caps: &regex::Captures<'_>| render_giphy(&caps[1], &caps[2], &caps[0]))
-		.to_string();
-
-	let with_imgur = IMGUR_COMMENT_LINK_REGEX
-		.replace_all(&with_giphy, |caps: &regex::Captures<'_>| {
-			format!(
-				r#"<a class="comment_gif_source" href="{}"><video class="comment_gif" data-src="/comment-gif/imgur/{}" muted loop autoplay playsinline preload="none"></video><span class="comment_gif_label">GIF — tap for source</span></a>"#,
-				&caps[1], &caps[2]
-			)
-		})
-		.to_string();
-
-	REDDIT_COMMENT_GIF_LINK_REGEX
-		.replace_all(&with_imgur, |caps: &regex::Captures<'_>| {
-			format!(
-				r#"<a class="comment_gif_source" href="{}"><img class="comment_gif" data-src="/comment-gif/reddit/{}" alt="GIF preview" loading="lazy"><span class="comment_gif_label">GIF — tap for source</span></a>"#,
-				&caps[1], &caps[2]
-			)
-		})
-		.to_string()
-}
-
 /// Rewrite Reddit links to Redlib in body of text
 pub fn rewrite_urls(input_text: &str) -> String {
 	let mut text1 =
@@ -1204,7 +1164,15 @@ pub fn rewrite_urls(input_text: &str) -> String {
 		if REDDIT_PREVIEW_REGEX.find(&text1).is_none() {
 			return text1;
 		} else {
-			let formatted_url = format_url(REDDIT_PREVIEW_REGEX.find(&text1).map(|x| x.as_str()).unwrap_or_default());
+			let captures = REDDIT_PREVIEW_REGEX.captures(&text1).expect("preview regex matched above");
+			let preview_type = match captures.get(1).map(|value| value.as_str()) {
+				Some("preview") => "/preview/pre",
+				Some("external-preview") => "/preview/external-pre",
+				_ => "/img",
+			};
+			// Preserve the surrounding anchor markup while rewriting its URL. Passing
+			// the entire greedy match through Url::parse discards the caption suffix.
+			let formatted_url = format!("{preview_type}{}", captures.get(2).map_or("", |value| value.as_str()));
 
 			let image_url = REDLIB_PREVIEW_LINK_REGEX.find(&formatted_url).map_or("", |m| m.as_str());
 			let mut image_caption = REDLIB_PREVIEW_TEXT_REGEX.find(&formatted_url).map_or("", |m| m.as_str());
@@ -1233,16 +1201,8 @@ pub fn rewrite_urls(input_text: &str) -> String {
 
 			/* In order to know if we're dealing with a normal or external preview we need to take a look at the first capture group of REDDIT_PREVIEW_REGEX
 			if it's preview we're dealing with something that needs /preview/pre, external-preview is /preview/external-pre, and i is /img */
-			let reddit_preview_regex_capture = REDDIT_PREVIEW_REGEX.captures(&text1).unwrap().get(1).map_or("", |m| m.as_str());
-
-			let _preview_type = match reddit_preview_regex_capture {
-				"preview" => "/preview/pre",
-				"external-preview" => "/preview/external-pre",
-				_ => "/img",
-			};
-
 			text1 = REDDIT_PREVIEW_REGEX
-				.replace(&text1, format!("{_preview_type}$2"))
+				.replace(&text1, format!("{preview_type}$2"))
 				.replace(&image_to_replace, &_image_replacement)
 		}
 	}
@@ -1513,8 +1473,40 @@ pub fn url_path_basename(path: &str) -> String {
 #[cfg(test)]
 mod tests {
 	use super::{
-		deflate_compress, deflate_decompress, embed_comment_gifs, format_num, format_url, render_bullet_lists, rewrite_emotes, rewrite_urls, url_path_basename, Post, Preferences,
+		deflate_compress, deflate_decompress, format_num, format_url, render_bullet_lists, rewrite_emotes, rewrite_urls, url_path_basename, GalleryMedia, Post, Preferences,
 	};
+
+	#[test]
+	fn gallery_animations_prefer_mp4_and_fall_back_safely() {
+		let items = serde_json::json!([{ "media_id": "animated" }, { "media_id": "gif_only" }]);
+		let metadata = serde_json::json!({
+			"animated": {
+				"m": "image/gif",
+				"s": {
+					"mp4": "https://preview.redd.it/animated.mp4?x=1",
+					"gif": "https://preview.redd.it/animated.gif?x=1",
+					"u": "https://preview.redd.it/animated.jpg?x=1",
+					"x": 640,
+					"y": 480
+				}
+			},
+			"gif_only": {
+				"m": "image/gif",
+				"s": {
+					"u": "https://i.redd.it/fallback.gif",
+					"x": 320,
+					"y": 240
+				}
+			}
+		});
+
+		let gallery = GalleryMedia::parse(&items, &metadata);
+		assert_eq!(gallery[0].url, "/preview/pre/animated.mp4?x=1");
+		assert_eq!(gallery[0].fallback_url, "/preview/pre/animated.gif?x=1");
+		assert!(gallery[0].is_video);
+		assert_eq!(gallery[1].url, "/img/fallback.gif");
+		assert!(!gallery[1].is_video);
+	}
 
 	#[test]
 	fn format_num_works() {
@@ -1620,45 +1612,6 @@ mod tests {
 		let urlencoded = serde_urlencoded::to_string(prefs).expect("Failed to serialize Prefs");
 
 		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&video_quality=best&hide_sidebar_and_summary=off&use_hls=on&autoplay_videos=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&hide_awards=off&hide_score=off&remove_default_feeds=off");
-	}
-
-	#[test]
-	fn embeds_allowlisted_comment_gifs_as_muted_video_links() {
-		let giphy = r#"<p><a href="https://giphy.com/gifs/funny-cat-AbC123">reaction</a></p>"#;
-		let rendered = embed_comment_gifs(giphy);
-		assert!(rendered.contains(r#"href="https://giphy.com/gifs/funny-cat-AbC123""#));
-		assert!(rendered.contains(r#"data-src="/comment-gif/giphy/AbC123""#));
-		assert!(rendered.contains("muted loop autoplay playsinline"));
-
-		let giphy_media = r#"<p><a href="https://media.giphy.com/media/XyZ987/giphy.gif">reaction</a></p>"#;
-		let rendered = embed_comment_gifs(giphy_media);
-		assert!(rendered.contains(r#"href="https://media.giphy.com/media/XyZ987/giphy.gif""#));
-		assert!(rendered.contains(r#"data-src="/comment-gif/giphy/XyZ987""#));
-
-		let giphy_image = r#"<p><a href="https://i.giphy.com/Qwe456.gif">reaction</a></p>"#;
-		let rendered = embed_comment_gifs(giphy_image);
-		assert!(rendered.contains(r#"href="https://i.giphy.com/Qwe456.gif""#));
-		assert!(rendered.contains(r#"data-src="/comment-gif/giphy/Qwe456""#));
-
-		let giphy_image_media = r#"<p><a href="https://i.giphy.com/media/Rty321/giphy.gif">reaction</a></p>"#;
-		let rendered = embed_comment_gifs(giphy_image_media);
-		assert!(rendered.contains(r#"data-src="/comment-gif/giphy/Rty321""#));
-
-		let imgur = r#"<p><a href="https://i.imgur.com/Z9y8X7.gifv">image</a></p>"#;
-		let rendered = embed_comment_gifs(imgur);
-		assert!(rendered.contains(r#"href="https://i.imgur.com/Z9y8X7.gifv""#));
-		assert!(rendered.contains(r#"data-src="/comment-gif/imgur/Z9y8X7""#));
-
-		let reddit = r#"<p><a href="/img/74epxqndv2fh1.gif">/img/74epxqndv2fh1.gif</a></p>"#;
-		let rendered = embed_comment_gifs(reddit);
-		assert!(rendered.contains(r#"href="/img/74epxqndv2fh1.gif""#));
-		assert!(rendered.contains(r#"<img class="comment_gif" data-src="/comment-gif/reddit/74epxqndv2fh1.gif""#));
-	}
-
-	#[test]
-	fn leaves_unapproved_comment_media_as_a_normal_link() {
-		let input = r#"<p><a href="https://example.com/reaction.gif">reaction</a></p>"#;
-		assert_eq!(embed_comment_gifs(input), input);
 	}
 
 	#[test]

@@ -8,13 +8,11 @@ use std::sync::LazyLock;
 
 use futures_lite::FutureExt;
 use hyper::{header::HeaderValue, Body, Request, Response};
-use log::{info, warn};
-use redlib::client::{canonical_path, proxy, rate_limit_check, CLIENT};
+use log::info;
+use redlib::client::{canonical_path, proxy, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
 use redlib::{config, duplicates, headers, instance_info, post, search, settings, subreddit, user};
-
-use redlib::client::OAUTH_CLIENT;
 
 // Create Services
 
@@ -106,13 +104,28 @@ async fn style() -> Result<Response<Body>, String> {
 	)
 }
 
-#[tokio::main]
-async fn main() {
+// DNS lookups and response compression run on Tokio's blocking pool, which
+// defaults to 512 threads. A burst of slow lookups could exceed the container's
+// PID limit and make thread creation fail, so keep that pool small.
+const MAX_BLOCKING_THREADS: usize = 16;
+
+fn main() {
+	tokio::runtime::Builder::new_multi_thread()
+		.enable_all()
+		.max_blocking_threads(MAX_BLOCKING_THREADS)
+		.build()
+		.expect("Failed to build Tokio runtime")
+		.block_on(run());
+}
+
+async fn run() {
 	// Load environment variables
 	_ = dotenvy::dotenv();
 
-	// Initialize logger
-	pretty_env_logger::init();
+	// Include an RFC 3339 UTC timestamp in every line. Container runtimes can
+	// add their own timestamps when logs are queried, but keeping the timestamp
+	// in Redlib's output makes exported and aggregated logs self-contained.
+	pretty_env_logger::init_timed();
 
 	let matches = Command::new("Redlib")
 		.version(env!("CARGO_PKG_VERSION"))
@@ -150,20 +163,6 @@ async fn main() {
 		)
 		.get_matches();
 
-	match rate_limit_check().await {
-		Ok(()) => {
-			info!("[✅] Rate limit check passed");
-		}
-		Err(e) => {
-			let mut message = format!("Rate limit check failed: {e}");
-			message += "\nThis may cause issues with the rate limit.";
-			message += "\nPlease report this error with the above information.";
-			message += "\nhttps://github.com/redlib-org/redlib/issues/new?assignees=sigaloid&labels=bug&title=%F0%9F%90%9B+Bug+Report%3A+Rate+limit+mismatch";
-			warn!("{}", message);
-			eprintln!("{message}");
-		}
-	}
-
 	let address = matches.get_one::<String>("address").unwrap();
 	let port = matches.get_one::<String>("port").unwrap();
 	let hsts = matches.get_one("hsts").map(|m: &String| m.as_str());
@@ -187,15 +186,15 @@ async fn main() {
 	// Force evaluation of statics. In instance_info case, we need to evaluate
 	// the timestamp so deploy date is accurate - in config case, we need to
 	// evaluate the configuration to avoid paying penalty at first request -
-	// in OAUTH case, we need to retrieve the token to avoid paying penalty
-	// at first request
+	// OAuth starts independently below so an upstream outage cannot block the
+	// server or occupy a Tokio worker indefinitely.
 
 	info!("Evaluating config.");
 	LazyLock::force(&config::CONFIG);
 	info!("Evaluating instance info.");
 	LazyLock::force(&instance_info::INSTANCE_INFO);
-	info!("Creating OAUTH client.");
-	LazyLock::force(&OAUTH_CLIENT);
+	info!("Starting background OAuth supervisor.");
+	redlib::oauth::start_oauth_supervisor();
 
 	// Define default headers (added to all responses)
 	app.default_headers = headers! {
@@ -253,9 +252,6 @@ async fn main() {
 		.at("/inline-replies.js/:build")
 		.get(|_| resource(include_str!("../static/inline-replies.js"), "text/javascript", true).boxed());
 	app
-		.at("/comment-gifs.js/:build")
-		.get(|_| resource(include_str!("../static/comment-gifs.js"), "text/javascript", true).boxed());
-	app
 		.at("/check_update.js")
 		.get(|_| resource(include_str!("../static/check_update.js"), "text/javascript", false).boxed());
 	app.at("/copy.js").get(|_| resource(include_str!("../static/copy.js"), "text/javascript", false).boxed());
@@ -272,15 +268,6 @@ async fn main() {
 	app.at("/vid/:id/CMAF/:size").get(|r| proxy(r, "https://v.redd.it/{id}/CMAF_{size}").boxed());
 	app.at("/hls/:id/*path").get(|r| proxy(r, "https://v.redd.it/{id}/{path}").boxed());
 	app.at("/img/*path").get(|r| proxy(r, "https://i.redd.it/{path}").boxed());
-	app
-		.at("/comment-gif/giphy/:id")
-		.get(|r| redlib::client::proxy_bounded(r, "https://media.giphy.com/media/{id}/giphy.mp4", 8 * 1024 * 1024, "video/mp4").boxed());
-	app
-		.at("/comment-gif/imgur/:id")
-		.get(|r| redlib::client::proxy_bounded(r, "https://i.imgur.com/{id}.mp4", 8 * 1024 * 1024, "video/mp4").boxed());
-	app
-		.at("/comment-gif/reddit/*path")
-		.get(|r| redlib::client::proxy_bounded(r, "https://i.redd.it/{path}", 8 * 1024 * 1024, "image/gif").boxed());
 	app.at("/thumb/:point/:id").get(|r| proxy(r, "https://{point}.thumbs.redditmedia.com/{id}").boxed());
 	app.at("/emoji/:id/:name").get(|r| proxy(r, "https://emoji.redditmedia.com/{id}/{name}").boxed());
 	app
@@ -442,8 +429,10 @@ async fn main() {
 	let server = app.listen(&listener);
 
 	// Run this server for... forever!
+	// Exit non-zero so `restart: on-failure` policies bring the server back.
 	if let Err(e) = server.await {
 		eprintln!("Server error: {e}");
+		std::process::exit(1);
 	}
 }
 
@@ -452,16 +441,22 @@ pub async fn proxy_commit_info() -> Result<Response<Body>, String> {
 		Response::builder()
 			.status(200)
 			.header("content-type", "application/atom+xml")
-			.body(Body::from(fetch_commit_info().await))
+			.body(Body::from(fetch_commit_info().await?))
 			.unwrap_or_default(),
 	)
 }
 
-#[cached(time = 600)]
-async fn fetch_commit_info() -> String {
+#[cached(time = 600, result = true)]
+async fn fetch_commit_info() -> Result<String, String> {
 	let url = "https://github.com/redlib-org/redlib/commits/main.atom";
 
-	CLIENT.get(url).send().await.expect("Failed to request GitHub").text().await.expect("Failed to read body")
+	let response = CLIENT
+		.get(url)
+		.timeout(std::time::Duration::from_secs(30))
+		.send()
+		.await
+		.map_err(|error| error.to_string())?;
+	response.text().await.map_err(|error| error.to_string())
 }
 
 pub async fn proxy_instances() -> Result<Response<Body>, String> {
@@ -469,14 +464,20 @@ pub async fn proxy_instances() -> Result<Response<Body>, String> {
 		Response::builder()
 			.status(200)
 			.header("content-type", "application/json")
-			.body(Body::from(fetch_instances().await))
+			.body(Body::from(fetch_instances().await?))
 			.unwrap_or_default(),
 	)
 }
 
-#[cached(time = 600)]
-async fn fetch_instances() -> String {
+#[cached(time = 600, result = true)]
+async fn fetch_instances() -> Result<String, String> {
 	let url = "https://raw.githubusercontent.com/redlib-org/redlib-instances/refs/heads/main/instances.json";
 
-	CLIENT.get(url).send().await.expect("Failed to request GitHub").text().await.expect("Failed to read body")
+	let response = CLIENT
+		.get(url)
+		.timeout(std::time::Duration::from_secs(30))
+		.send()
+		.await
+		.map_err(|error| error.to_string())?;
+	response.text().await.map_err(|error| error.to_string())
 }

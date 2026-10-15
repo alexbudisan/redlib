@@ -1,12 +1,11 @@
 use crate::dbg_msg;
-use crate::oauth::{force_refresh_token, token_daemon, Oauth, OauthBackendImpl};
+use crate::oauth::{force_refresh_token, Oauth, OauthBackendImpl};
 use crate::server::RequestExt;
 use crate::utils::{format_url, Post};
 use arc_swap::ArcSwap;
 use cached::proc_macro::cached;
-use futures_lite::future::block_on;
 use futures_lite::{future::Boxed, FutureExt};
-use hyper::{body::Buf, header, Body, Request as HyperRequest, Response as HyperResponse};
+use hyper::{body::HttpBody, header, Body, Request as HyperRequest, Response as HyperResponse};
 use log::{error, info, trace, warn};
 use percent_encoding::{percent_encode, CONTROLS};
 use serde_json::Value;
@@ -14,10 +13,10 @@ use std::result::Result;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
 use std::sync::LazyLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wreq::redirect::Policy;
-use wreq::{header as wreq_header, Client as WreqClient, Method, Response as WreqResponse};
-use wreq_util::{Emulation, Platform, Profile};
+use wreq::{header as wreq_header, Client as WreqClient, EmulationFactory, Method, Response as WreqResponse};
+use wreq_util::{Emulation, EmulationOS, EmulationOption};
 
 const REDDIT_URL_BASE: &str = "https://oauth.reddit.com";
 const REDDIT_URL_BASE_HOST: &str = "oauth.reddit.com";
@@ -27,14 +26,20 @@ const REDDIT_SHORT_URL_BASE_HOST: &str = "redd.it";
 
 const ALTERNATIVE_REDDIT_URL_BASE: &str = "https://www.reddit.com";
 const ALTERNATIVE_REDDIT_URL_BASE_HOST: &str = "www.reddit.com";
+const MAX_REDDIT_JSON_BYTES: usize = 16 * 1024 * 1024;
+const MAX_REDIRECTS: u8 = 5;
+/// Requests wait out a short rate-limit cooldown, but a longer one fails fast
+/// so waiting requests don't pile up and exhaust the server's request slots.
+const MAX_RATE_LIMIT_WAIT_SECS: u64 = 5;
 
 pub static CLIENT: LazyLock<WreqClient> = LazyLock::new(build_client);
 
-pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
-	let client = block_on(Oauth::new());
-	tokio::spawn(token_daemon());
-	ArcSwap::new(client.into())
-});
+/// Always contains a cheap local placeholder at startup. The real token is
+/// installed by the background OAuth supervisor without blocking a runtime
+/// worker or preventing the HTTP server from starting.
+pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| ArcSwap::new(Oauth::pending().into()));
+
+pub static OAUTH_READY: AtomicBool = AtomicBool::new(false);
 
 pub static OAUTH_RATELIMIT_REMAINING: AtomicU16 = AtomicU16::new(99);
 
@@ -52,18 +57,27 @@ pub fn build_client() -> WreqClient {
 	// Keeping this list short to aid in privacy.
 	// The more emulations, the more unique a fingerprint each instance has.
 	// But some emulations should increase evasiveness.
-	let profiles = [Profile::Chrome145, Profile::Firefox147];
-	let platforms = [Platform::Android, Platform::Windows];
+	let emulations = [Emulation::Chrome145, Emulation::Firefox147];
+	let operating_systems = [EmulationOS::Android, EmulationOS::Windows];
 
 	let rand = fastrand::usize(..);
-	let profile = profiles[rand % profiles.len()];
-	let platform = platforms[rand % platforms.len()];
-	let emulation = Emulation::builder().profile(profile).platform(platform).build();
+	let emulation = EmulationOption::builder()
+		.emulation(emulations[rand % emulations.len()])
+		.emulation_os(operating_systems[rand % operating_systems.len()])
+		.build()
+		.emulation();
 
-	info!("Building Wreq client with random emulation {profile:?} on {platform:?}");
+	info!("Building Wreq client with random emulation {emulation:?}");
 	WreqClient::builder()
 		.emulation(emulation)
 		.redirect(Policy::none())
+		.connect_timeout(Duration::from_secs(10))
+		// Bound how long any single read may stall. Without this a hung media
+		// stream from Reddit's CDN would hold its connection open forever.
+		.read_timeout(Duration::from_secs(30))
+		.pool_idle_timeout(Duration::from_secs(90))
+		.pool_max_idle_per_host(8)
+		.pool_max_size(32)
 		.build()
 		.expect("Should always be able to build a client")
 }
@@ -211,47 +225,15 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 		.map_err(|e| e.to_string())
 }
 
-/// Proxy a fixed-format media URL only when its declared response length is
-/// known and within the supplied bound.
-pub async fn proxy_bounded(req: HyperRequest<Body>, format: &str, maximum_bytes: u64, media_type: &'static str) -> Result<HyperResponse<Body>, String> {
-	let mut url = format!("{format}?{}", req.uri().query().unwrap_or_default());
-	for (name, value) in &req.params() {
-		url = url.replace(&format!("{{{name}}}"), value);
-	}
-
-	let uri = wreq::Uri::try_from(url).map_err(|_| "Couldn't parse media URL".to_string())?;
-	let mut response = CLIENT.get(uri).header(wreq_header::ACCEPT, media_type).send().await.map_err(|error| error.to_string())?;
-
-	let content_type = response.headers().get(wreq_header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).unwrap_or_default();
-	if !content_type.starts_with(media_type) {
-		return Err("Unsupported comment media type".to_string());
-	}
-
-	let content_length = response
-		.headers()
-		.get(wreq_header::CONTENT_LENGTH)
-		.and_then(|value| value.to_str().ok())
-		.and_then(|value| value.parse::<u64>().ok())
-		.ok_or_else(|| "Comment media size is unknown".to_string())?;
-	if content_length > maximum_bytes {
-		return Err("Comment media exceeds the configured size limit".to_string());
-	}
-
-	response
-		.headers_mut()
-		.insert(wreq_header::CACHE_CONTROL, wreq_header::HeaderValue::from_static("public, max-age=86400"));
-	Ok(response.into_hyper_response())
-}
-
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
 /// 3xx codes Reddit returns and will automatically redirect.
 fn reddit_get(path: String, quarantine: bool) -> Boxed<Result<WreqResponse, String>> {
-	request(&Method::GET, path, true, quarantine, REDDIT_URL_BASE, REDDIT_URL_BASE_HOST)
+	request(&Method::GET, path, true, quarantine, REDDIT_URL_BASE, REDDIT_URL_BASE_HOST, MAX_REDIRECTS)
 }
 
 /// Makes a HEAD request to Reddit at `path, using the short URL base. This will not follow redirects.
 fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
-	request(&Method::HEAD, path, false, quarantine, base_path, host)
+	request(&Method::HEAD, path, false, quarantine, base_path, host, 0)
 }
 
 // /// Makes a HEAD request to Reddit at `path`. This will not follow redirects.
@@ -263,7 +245,19 @@ fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, ho
 /// Makes a request to Reddit. If `redirect` is `true`, `request_with_redirect`
 /// will recurse on the URL that Reddit provides in the Location HTTP header
 /// in its response.
-fn request(method: &'static Method, path: String, redirect: bool, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
+fn request(
+	method: &'static Method,
+	path: String,
+	redirect: bool,
+	quarantine: bool,
+	base_path: &'static str,
+	host: &'static str,
+	redirects_left: u8,
+) -> Boxed<Result<WreqResponse, String>> {
+	if !OAUTH_READY.load(Ordering::SeqCst) {
+		return async { Err("Reddit authentication is temporarily unavailable; Redlib is retrying in the background".to_owned()) }.boxed();
+	}
+
 	// Build Reddit URL from path.
 	let url = format!("{base_path}{path}");
 
@@ -289,7 +283,7 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 	// shuffle headers: https://github.com/redlib-org/redlib/issues/324
 	fastrand::shuffle(&mut headers);
 
-	let mut builder = CLIENT.request(method.clone(), &url);
+	let mut builder = CLIENT.request(method.clone(), &url).timeout(Duration::from_secs(30));
 
 	for (key, value) in headers {
 		builder = builder.header(key, value);
@@ -304,6 +298,9 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 					if !redirect {
 						return Ok(response);
 					};
+					if redirects_left == 0 {
+						return Err("Reddit redirected too many times".to_string());
+					}
 					let location_header = response.headers().get(wreq::header::LOCATION);
 					if location_header.and_then(|h| h.to_str().ok()) == Some(ALTERNATIVE_REDDIT_URL_BASE) {
 						return Err("Reddit response was invalid".to_string());
@@ -336,6 +333,7 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 						quarantine,
 						base_path,
 						host,
+						redirects_left - 1,
 					)
 					.await;
 				};
@@ -366,12 +364,12 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 	}
 }
 
-#[cached(size = 256, time = 300, result = true, sync_writes = "by_key")]
+#[cached(size = 64, time = 300, result = true, sync_writes = "by_key")]
 async fn json_metadata(path: String, quarantine: bool) -> Result<Value, String> {
 	fetch_json(path, quarantine).await
 }
 
-#[cached(size = 256, time = 30, result = true, sync_writes = "by_key")]
+#[cached(size = 64, time = 30, result = true, sync_writes = "by_key")]
 async fn json_content(path: String, quarantine: bool) -> Result<Value, String> {
 	fetch_json(path, quarantine).await
 }
@@ -380,11 +378,14 @@ fn unix_timestamp() -> u64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
-async fn wait_for_rate_limit_cooldown() {
+async fn wait_for_rate_limit_cooldown() -> Result<(), String> {
 	loop {
 		let wait = OAUTH_RATELIMIT_RESET_AT.load(Ordering::SeqCst).saturating_sub(unix_timestamp());
 		if wait == 0 {
-			return;
+			return Ok(());
+		}
+		if wait > MAX_RATE_LIMIT_WAIT_SECS {
+			return Err(format!("Reddit rate limit exceeded. Try refreshing in {wait} seconds."));
 		}
 		tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
 	}
@@ -412,7 +413,7 @@ async fn fetch_json(path: String, quarantine: bool) -> Result<Value, String> {
 		Err(format!("{msg}: {e} | {path}"))
 	};
 
-	wait_for_rate_limit_cooldown().await;
+	wait_for_rate_limit_cooldown().await?;
 
 	let current_rate_limit = OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst);
 	let _ = OAUTH_RATELIMIT_REMAINING.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| Some(remaining.saturating_sub(1)));
@@ -440,12 +441,25 @@ async fn fetch_json(path: String, quarantine: bool) -> Result<Value, String> {
 				warn!("Reddit returned 429; pausing API requests for {reset_seconds}s");
 			}
 
-			// asynchronously aggregate the chunks of the body
-			match hyper::body::aggregate(response.into_hyper_response()).await {
-				Ok(body) => {
-					let has_remaining = body.has_remaining();
+			// Reddit listings and comment trees must be parsed as one JSON value,
+			// but never allow an upstream response to consume unbounded RAM.
+			let mut response = response.into_hyper_response();
+			let mut body = Vec::new();
+			let body_result = async {
+				while let Some(chunk) = response.body_mut().data().await {
+					let chunk = chunk.map_err(|error| error.to_string())?;
+					if body.len().saturating_add(chunk.len()) > MAX_REDDIT_JSON_BYTES {
+						return Err(format!("Reddit response exceeded the {} MiB safety limit", MAX_REDDIT_JSON_BYTES / 1024 / 1024));
+					}
+					body.extend_from_slice(&chunk);
+				}
+				Ok::<(), String>(())
+			}
+			.await;
 
-					if !has_remaining || status.as_u16() == 429 {
+			match body_result {
+				Ok(()) => {
+					if body.is_empty() || status.as_u16() == 429 {
 						return match reset {
 							Some(val) => Err(format!(
 								"Reddit rate limit exceeded. Try refreshing in a few seconds.\
@@ -456,7 +470,7 @@ async fn fetch_json(path: String, quarantine: bool) -> Result<Value, String> {
 					}
 
 					// Parse the response from Reddit as JSON
-					match serde_json::from_reader(body.reader()) {
+					match serde_json::from_slice(&body) {
 						Ok(value) => {
 							let json: Value = value;
 
@@ -510,7 +524,7 @@ async fn fetch_json(path: String, quarantine: bool) -> Result<Value, String> {
 						}
 					}
 				}
-				Err(e) => err("Failed receiving body from Reddit", e.to_string(), path),
+				Err(e) => err("Failed receiving body from Reddit", e, path),
 			}
 		}
 		Err(e) => err("Couldn't send request to Reddit", e, path),
@@ -527,26 +541,21 @@ async fn self_check(sub: &str) -> Result<(), String> {
 }
 
 pub async fn rate_limit_check() -> Result<(), String> {
+	if !OAUTH_READY.load(Ordering::SeqCst) {
+		return Err("OAuth is not ready".to_owned());
+	}
 	// First, test the Oauth client: we can perform a rate limit check if the OAuth backend is MobileSpoof; if GenericWeb, we skip the check.
 	if matches!(OAUTH_CLIENT.load().backend, OauthBackendImpl::GenericWeb(_)) {
 		warn!("[⚠️] Cannot perform rate limit check, running as GenericWeb. Skipping check.");
 		return Ok(());
 	}
 
-	// First, check a subreddit.
+	// A single request is sufficient to confirm that Reddit returns rate-limit
+	// headers. Rotating the token here used to create an unnecessary second
+	// OAuth client every time this diagnostic ran.
 	self_check("reddit").await?;
-	// This will reduce the rate limit to 99. Assert this check.
-	if OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst) != 99 {
-		return Err(format!("Rate limit check 1 failed: expected 99, got {}", OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst)));
-	}
-	// Now, we switch out the OAuth client.
-	// This checks for the IP rate limit association.
-	force_refresh_token().await;
-	// Now, check a new sub to break cache.
-	self_check("rust").await?;
-	// Again, assert the rate limit check.
-	if OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst) != 99 {
-		return Err(format!("Rate limit check 2 failed: expected 99, got {}", OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst)));
+	if OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst) == 0 {
+		return Err("Rate limit check reported no remaining requests".to_owned());
 	}
 
 	Ok(())

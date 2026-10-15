@@ -1,11 +1,11 @@
 use crate::{
-	client::{CLIENT, OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER, OAUTH_RATELIMIT_REMAINING},
+	client::{CLIENT, OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER, OAUTH_RATELIMIT_REMAINING, OAUTH_READY},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
 };
 use base64::{engine::general_purpose, Engine as _};
 use log::{error, info, trace, warn};
 use serde_json::json;
-use std::{collections::HashMap, sync::atomic::Ordering, time::Duration};
+use std::{collections::HashMap, sync::atomic::Ordering, sync::Arc, time::Duration};
 use tegen::tegen::TextGenerator;
 use tokio::time::{error::Elapsed, timeout};
 
@@ -13,7 +13,10 @@ const REDDIT_ANDROID_OAUTH_CLIENT_ID: &str = "ohXpoqrZYub1kg";
 
 const AUTH_ENDPOINT: &str = "https://www.reddit.com";
 
-const OAUTH_TIMEOUT: Duration = Duration::from_secs(5);
+const OAUTH_TIMEOUT: Duration = Duration::from_secs(15);
+const OAUTH_INITIAL_BACKOFF: Duration = Duration::from_secs(10);
+const OAUTH_MAX_BACKOFF: Duration = Duration::from_secs(300);
+const OAUTH_ATTEMPTS_PER_BACKEND: u32 = 3;
 
 // Response from OAuth backend authentication
 #[derive(Debug, Clone)]
@@ -69,10 +72,23 @@ pub struct Oauth {
 }
 
 impl Oauth {
+	/// Construct a local-only placeholder so startup never waits on Reddit.
+	pub(crate) fn pending() -> Self {
+		let backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new());
+		Self {
+			headers_map: HashMap::new(),
+			expires_in: 0,
+			backend,
+		}
+	}
+
 	/// Create a new OAuth client
 	pub(crate) async fn new() -> Self {
-		// Try MobileSpoofAuth first, then fall back to GenericWebAuth
-		let mut failure_count = 0;
+		// OAuth is required to serve Reddit content, so keep the process alive
+		// while the upstream is unavailable. A capped exponential backoff avoids
+		// turning an outage into a restart/request storm.
+		let mut failure_count = 0_u32;
+		let mut backend_failure_count = 0_u32;
 		let mut backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new());
 
 		loop {
@@ -83,35 +99,35 @@ impl Oauth {
 					return oauth;
 				}
 				Ok(Err(e)) => {
-					error!(
-						"[⛔] Failed to create OAuth client: {}. Retrying in 5 seconds...",
-						match e {
-							AuthError::Wreq(error) => error.to_string(),
-							AuthError::SerdeDeserialize(error) => error.to_string(),
-							AuthError::Field(error) => error.to_string(),
-						}
-					);
+					error!("[⛔] Failed to create OAuth client: {} (details: {e:?})", e.summary());
 				}
 				Err(_) => {
-					error!("[⛔] Failed to create OAuth client before timeout. Retrying in 5 seconds...");
+					error!("[⛔] OAuth request exceeded the {OAUTH_TIMEOUT:?} timeout");
 				}
 			}
 
-			failure_count += 1;
+			failure_count = failure_count.saturating_add(1);
+			backend_failure_count = backend_failure_count.saturating_add(1);
 
-			// Switch to GenericWeb after 5 failures with MobileSpoof
-			if matches!(backend, OauthBackendImpl::MobileSpoof(_)) && failure_count >= 5 {
-				warn!("[🔄] MobileSpoofAuth failed 5 times. Falling back to GenericWebAuth...");
-				backend = OauthBackendImpl::GenericWeb(GenericWebAuth::new());
+			// Occasionally try the alternative backend, without rapidly hitting both
+			// OAuth endpoints during a general connectivity outage.
+			if backend_failure_count >= OAUTH_ATTEMPTS_PER_BACKEND {
+				backend = match backend {
+					OauthBackendImpl::MobileSpoof(_) => {
+						warn!("[🔄] Mobile OAuth failed {backend_failure_count} times; trying GenericWeb OAuth next");
+						OauthBackendImpl::GenericWeb(GenericWebAuth::new())
+					}
+					OauthBackendImpl::GenericWeb(_) => {
+						warn!("[🔄] GenericWeb OAuth failed {backend_failure_count} times; trying mobile OAuth next");
+						OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new())
+					}
+				};
+				backend_failure_count = 0;
 			}
 
-			// Crash after 10 total failures
-			if failure_count >= 10 {
-				error!("[⛔] Failed to create OAuth client (mobile + generic)");
-				std::process::exit(1);
-			}
-
-			tokio::time::sleep(OAUTH_TIMEOUT).await;
+			let delay = oauth_retry_delay(failure_count);
+			warn!("[⏳] OAuth remains unavailable; retrying in {delay:?} (failure {failure_count})");
+			tokio::time::sleep(delay).await;
 		}
 	}
 
@@ -138,11 +154,34 @@ impl Oauth {
 	}
 }
 
+/// Start OAuth acquisition in the background. Until the first token arrives,
+/// Reddit API requests fail quickly instead of tying up runtime worker threads.
+pub fn start_oauth_supervisor() {
+	OAUTH_READY.store(false, Ordering::SeqCst);
+	tokio::spawn(async {
+		let client = Oauth::new().await;
+		OAUTH_CLIENT.swap(client.into());
+		OAUTH_READY.store(true, Ordering::SeqCst);
+		info!("[✅] OAuth is ready; starting refresh supervisor");
+		token_daemon().await;
+	});
+}
+
 #[derive(Debug)]
 enum AuthError {
 	Wreq(wreq::Error),
 	SerdeDeserialize(serde_json::Error),
 	Field(&'static str),
+}
+
+impl AuthError {
+	fn summary(&self) -> String {
+		match self {
+			Self::Wreq(error) => error.to_string(),
+			Self::SerdeDeserialize(error) => error.to_string(),
+			Self::Field(error) => (*error).to_owned(),
+		}
+	}
 }
 
 impl From<wreq::Error> for AuthError {
@@ -161,7 +200,8 @@ pub async fn token_daemon() {
 	// Monitor for refreshing token
 	loop {
 		// Get expiry time - be sure to not hold the read lock
-		let expires_in = { OAUTH_CLIENT.load_full().expires_in };
+		let scheduled_client = OAUTH_CLIENT.load_full();
+		let expires_in = scheduled_client.expires_in;
 
 		// Refresh two minutes early without underflowing malformed or unusually
 		// short expiry values.
@@ -170,6 +210,13 @@ pub async fn token_daemon() {
 		info!("[⏳] Waiting for {duration:?} seconds before refreshing OAuth token...");
 
 		tokio::time::sleep(duration).await;
+
+		// A 401-triggered refresh may have replaced the token while this timer was
+		// sleeping. Do not immediately replace that fresh token again.
+		if !Arc::ptr_eq(&scheduled_client, &OAUTH_CLIENT.load_full()) {
+			info!("[✅] OAuth token was refreshed while the timer slept; rescheduling");
+			continue;
+		}
 
 		info!("[⌛] {duration:?} Elapsed! Refreshing OAuth token...");
 
@@ -184,17 +231,42 @@ fn token_refresh_delay(expires_in: u64) -> Duration {
 	Duration::from_secs(expires_in.saturating_sub(120).max(1))
 }
 
+fn oauth_backoff_base(failure_count: u32) -> Duration {
+	let exponent = failure_count.saturating_sub(1).min(5);
+	OAUTH_INITIAL_BACKOFF.saturating_mul(1_u32 << exponent).min(OAUTH_MAX_BACKOFF)
+}
+
+fn oauth_retry_delay(failure_count: u32) -> Duration {
+	let base = oauth_backoff_base(failure_count);
+	// Spread retries from multiple instances over an 80%-120% window.
+	let jitter_percent = fastrand::u64(80..=120);
+	Duration::from_millis((base.as_millis() as u64).saturating_mul(jitter_percent) / 100)
+}
+
+struct RefreshGuard;
+
+impl Drop for RefreshGuard {
+	fn drop(&mut self) {
+		OAUTH_IS_ROLLING_OVER.store(false, Ordering::SeqCst);
+	}
+}
+
 pub async fn force_refresh_token() {
+	if !OAUTH_READY.load(Ordering::SeqCst) {
+		trace!("Skipping OAuth refresh while initial authentication is still pending");
+		return;
+	}
 	if OAUTH_IS_ROLLING_OVER.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
 		trace!("Skipping refresh token roll over, already in progress");
 		return;
 	}
+	let _refresh_guard = RefreshGuard;
 
 	trace!("Rolling over refresh token. Current rate limit: {}", OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst));
 	let new_client = Oauth::new().await;
 	OAUTH_CLIENT.swap(new_client.into());
+	OAUTH_READY.store(true, Ordering::SeqCst);
 	OAUTH_RATELIMIT_REMAINING.store(99, Ordering::SeqCst);
-	OAUTH_IS_ROLLING_OVER.store(false, Ordering::SeqCst);
 }
 
 #[derive(Debug, Clone, Default)]
@@ -485,6 +557,15 @@ mod tests {
 		assert_eq!(token_refresh_delay(0), Duration::from_secs(1));
 		assert_eq!(token_refresh_delay(60), Duration::from_secs(1));
 		assert_eq!(token_refresh_delay(3600), Duration::from_secs(3480));
+	}
+
+	#[test]
+	fn oauth_backoff_is_exponential_and_capped() {
+		assert_eq!(oauth_backoff_base(1), Duration::from_secs(10));
+		assert_eq!(oauth_backoff_base(2), Duration::from_secs(20));
+		assert_eq!(oauth_backoff_base(5), Duration::from_secs(160));
+		assert_eq!(oauth_backoff_base(6), Duration::from_secs(300));
+		assert_eq!(oauth_backoff_base(100), Duration::from_secs(300));
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

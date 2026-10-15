@@ -144,9 +144,19 @@
 	<div class="gallery">
 	{% for image in post.gallery -%}
 		<figure>
-			<a href="{{ image.url }}" ><img loading="lazy" alt="Gallery image" src="{{ image.url }}"/></a>
+			{% if image.is_video %}
+			<video class="gallery_animation" width="{{ image.width }}" height="{{ image.height }}" muted autoplay loop playsinline controls preload="metadata">
+				<source src="{{ image.url }}" type="video/mp4">
+				<a href="{{ image.fallback_url }}">Open animated media</a>
+			</video>
+			{% else %}
+			<a href="{{ image.url }}"><img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" alt="Gallery image" src="{{ image.url }}"/></a>
+			{% endif %}
 			<figcaption>
 				<p>{{ image.caption }}</p>
+				{% if image.is_video && !image.fallback_url.is_empty() %}
+				<p><a class="gallery_media_fallback" href="{{ image.fallback_url }}">Open GIF source</a></p>
+				{% endif %}
 				{% if image.outbound_url.len() > 0 %}
 				<p><a class="outbound_url" href="{{ image.outbound_url }}" rel="nofollow">{{ image.outbound_url }}</a>
 				{% endif %}

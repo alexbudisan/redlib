@@ -23,7 +23,7 @@ struct SettingsTemplate {
 
 // CONSTANTS
 
-const PREFS: [&str; 23] = [
+const PREFS: [&str; 19] = [
 	"theme",
 	"front_page",
 	"layout",
@@ -43,18 +43,11 @@ const PREFS: [&str; 23] = [
 	"disable_visit_reddit_confirmation",
 	"video_quality",
 	"remove_default_feeds",
-	"embed_comment_gifs",
-	"disable_gifs_on_metered",
-	"comment_gif_limit",
-	"comment_gif_total_mb",
 ];
+const REMOVED_PREFS: [&str; 4] = ["embed_comment_gifs", "disable_gifs_on_metered", "comment_gif_limit", "comment_gif_total_mb"];
 
-fn sanitize_preference(name: &str, value: &str) -> String {
-	match name {
-		"comment_gif_limit" => value.parse::<u16>().unwrap_or(10).min(50).to_string(),
-		"comment_gif_total_mb" => value.parse::<u16>().unwrap_or(40).clamp(1, 100).to_string(),
-		_ => value.to_owned(),
-	}
+fn sanitize_preference(_name: &str, value: &str) -> String {
+	value.to_owned()
 }
 
 // FUNCTIONS
@@ -102,6 +95,9 @@ pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
 			),
 			None => response.remove_cookie(name.to_string()),
 		};
+	}
+	for name in REMOVED_PREFS {
+		response.remove_cookie(name.to_string());
 	}
 
 	Ok(response)
@@ -199,7 +195,7 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 			// Increment subscriptions cookie number
 			subscriptions_number_to_delete_from += 1;
 		}
-	} else {
+	} else if remove_cookies {
 		// Remove unnumbered subscriptions cookie
 		response.remove_cookie("subscriptions".to_string());
 
@@ -250,7 +246,7 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 			// Increment filters cookie number
 			filters_number_to_delete_from += 1;
 		}
-	} else {
+	} else if remove_cookies {
 		// Remove unnumbered filters cookie
 		response.remove_cookie("filters".to_string());
 
@@ -371,18 +367,4 @@ pub async fn update_list(req: Request<Body>) -> Result<Response<Body>, String> {
 		response.remove_cookie(format!("{cookie_name}{index}"));
 	}
 	Ok(response)
-}
-
-#[cfg(test)]
-mod tests {
-	use super::sanitize_preference;
-
-	#[test]
-	fn bounds_comment_gif_limits() {
-		assert_eq!(sanitize_preference("comment_gif_limit", "500"), "50");
-		assert_eq!(sanitize_preference("comment_gif_limit", "invalid"), "10");
-		assert_eq!(sanitize_preference("comment_gif_total_mb", "0"), "1");
-		assert_eq!(sanitize_preference("comment_gif_total_mb", "500"), "100");
-		assert_eq!(sanitize_preference("comment_gif_total_mb", "invalid"), "40");
-	}
 }

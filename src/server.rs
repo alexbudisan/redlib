@@ -22,12 +22,25 @@ use std::{
 	io,
 	pin::Pin,
 	result::Result,
-	str::{from_utf8, Split},
+	str::Split,
 	string::ToString,
+	sync::{Arc, LazyLock},
+	time::Duration,
 };
 use time::OffsetDateTime;
+use tokio::sync::Semaphore;
 
 use crate::{config, dbg_msg};
+
+const MAX_ACTIVE_REQUESTS: usize = 32;
+const MAX_COMPRESSION_JOBS: usize = 2;
+/// How long a request may wait for a free slot before being rejected with 503.
+const REQUEST_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Backstop for a route handler that never completes. Proxied media only
+/// counts until its headers arrive; the body then streams outside this limit.
+const HANDLER_TIMEOUT: Duration = Duration::from_secs(60);
+static REQUEST_LIMIT: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(MAX_ACTIVE_REQUESTS)));
+static COMPRESSION_LIMIT: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(MAX_COMPRESSION_JOBS));
 
 const BANNED_USER_AGENTS: &[&str] = &[
 	"AI2Bot",
@@ -316,68 +329,25 @@ impl Server {
 			// let shared_router = router.clone();
 			async move {
 				Ok::<_, String>(service_fn(move |req: Request<Body>| {
-					let req_headers = req.headers().clone();
-					let def_headers = default_headers.clone();
-
-					// Catch robots.txt-disrespecful bots who still identify themselves
-					// Typically justified as "human triggered" actions.
-					if match config::get_setting("REDLIB_ROBOTS_DISABLE_INDEXING") {
-						Some(val) => val == "on",
-						None => false,
-					} {
-						if let Some(user_agent) = req_headers.get("user-agent") {
-							if let Ok(user_agent_str) = user_agent.to_str() {
-								for banned in BANNED_USER_AGENTS {
-									if user_agent_str.contains(banned) {
-										return new_boilerplate(def_headers, req_headers, 403, Body::from("Forbidden")).boxed();
-									}
-								}
+					let router = router.clone();
+					let default_headers = default_headers.clone();
+					let request_limit = REQUEST_LIMIT.clone();
+					async move {
+						// When every slot is busy, reject quickly rather than queueing
+						// without bound; an ever-growing queue is what turns a slow
+						// upstream into an unresponsive (and unhealthy) container.
+						let _permit = match tokio::time::timeout(REQUEST_QUEUE_TIMEOUT, request_limit.acquire_owned()).await {
+							Ok(permit) => permit.map_err(|_| "Request limiter closed".to_owned())?,
+							Err(_) => {
+								let req_headers = req.headers().clone();
+								return new_boilerplate(default_headers, req_headers, 503, Body::from("Server busy, try again shortly")).await;
 							}
+						};
+						let req_headers = req.headers().clone();
+						match tokio::time::timeout(HANDLER_TIMEOUT, handle_request(router, default_headers.clone(), req)).await {
+							Ok(result) => result,
+							Err(_) => new_boilerplate(default_headers, req_headers, 504, Body::from("Timed out waiting for Reddit")).await,
 						}
-					}
-
-					// Remove double slashes and decode encoded slashes
-					let mut path = req.uri().path().replace("//", "/").replace("%2F", "/");
-
-					// Remove trailing slashes
-					if path != "/" && path.ends_with('/') {
-						path.pop();
-					}
-
-					// Replace HEAD with GET for routing
-					let (method, is_head) = match req.method() {
-						&Method::HEAD => (&Method::GET, true),
-						method => (method, false),
-					};
-
-					// Match the visited path with an added route
-					match router.recognize(&format!("/{}{}", method.as_str(), path)) {
-						// If a route was configured for this path
-						Ok(found) => {
-							let mut parammed = req;
-							parammed.set_params(found.params().clone());
-
-							// Run the route's function
-							let func = (found.handler().to_owned().to_owned())(parammed);
-							async move {
-								match func.await {
-									Ok(mut res) => {
-										res.headers_mut().extend(def_headers);
-										if is_head {
-											*res.body_mut() = Body::empty();
-										} else {
-											let _ = compress_response(&req_headers, &mut res).await;
-										}
-
-										Ok(res)
-									}
-									Err(msg) => new_boilerplate(def_headers, req_headers, 500, if is_head { Body::empty() } else { Body::from(msg) }).await,
-								}
-							}
-							.boxed()
-						}
-						// If there was a routing error
-						Err(e) => new_boilerplate(def_headers, req_headers, 404, if is_head { Body::empty() } else { e.into() }).boxed(),
 					}
 				}))
 			}
@@ -387,7 +357,13 @@ impl Server {
 		let address = &addr.parse().unwrap_or_else(|_| panic!("Cannot parse {addr} as address (example format: 0.0.0.0:8080)"));
 
 		// Bind server to address specified above. Gracefully shut down if CTRL+C is pressed
-		let server = HyperServer::bind(address).serve(make_svc).with_graceful_shutdown(async {
+		// Drop clients that never finish sending headers, and detect dead peers
+		// so their connections don't accumulate.
+		let server = HyperServer::bind(address)
+			.http1_header_read_timeout(Duration::from_secs(15))
+			.tcp_keepalive(Some(Duration::from_secs(60)))
+			.serve(make_svc)
+			.with_graceful_shutdown(async {
 			#[cfg(windows)]
 			// Wait for the CTRL+C signal
 			tokio::signal::ctrl_c().await.expect("Failed to install CTRL+C signal handler");
@@ -404,6 +380,49 @@ impl Server {
 		});
 
 		server.boxed()
+	}
+}
+
+async fn handle_request(router: Router<fn(Request<Body>) -> BoxResponse>, default_headers: HeaderMap, req: Request<Body>) -> Result<Response<Body>, String> {
+	let req_headers = req.headers().clone();
+	let def_headers = default_headers;
+
+	if config::get_setting("REDLIB_ROBOTS_DISABLE_INDEXING").is_some_and(|value| value == "on") {
+		if let Some(user_agent) = req_headers.get("user-agent").and_then(|value| value.to_str().ok()) {
+			if BANNED_USER_AGENTS.iter().any(|banned| user_agent.contains(banned)) {
+				return new_boilerplate(def_headers, req_headers, 403, Body::from("Forbidden")).await;
+			}
+		}
+	}
+
+	let mut path = req.uri().path().replace("//", "/").replace("%2F", "/");
+	if path != "/" && path.ends_with('/') {
+		path.pop();
+	}
+
+	let (method, is_head) = match req.method() {
+		&Method::HEAD => (&Method::GET, true),
+		method => (method, false),
+	};
+
+	match router.recognize(&format!("/{}{}", method.as_str(), path)) {
+		Ok(found) => {
+			let mut parammed = req;
+			parammed.set_params(found.params().clone());
+			match (found.handler().to_owned().to_owned())(parammed).await {
+				Ok(mut res) => {
+					res.headers_mut().extend(def_headers);
+					if is_head {
+						*res.body_mut() = Body::empty();
+					} else {
+						let _ = compress_response(&req_headers, &mut res).await;
+					}
+					Ok(res)
+				}
+				Err(msg) => new_boilerplate(def_headers, req_headers, 500, if is_head { Body::empty() } else { Body::from(msg) }).await,
+			}
+		}
+		Err(error) => new_boilerplate(def_headers, req_headers, 404, if is_head { Body::empty() } else { error.into() }).await,
 	}
 }
 
@@ -441,7 +460,7 @@ async fn new_boilerplate(
 /// Accept-Encoding: gzip, compress, br
 /// Accept-Encoding: br;q=1.0, gzip;q=0.8, *;q=0.1
 /// ```
-#[cached]
+#[cached(size = 32, time = 3600)]
 fn determine_compressor(accept_encoding: String) -> Option<CompressionType> {
 	if accept_encoding.is_empty() {
 		return None;
@@ -602,27 +621,12 @@ fn determine_compressor(accept_encoding: String) -> Option<CompressionType> {
 /// This function logs errors to stderr, but only in debug mode. No information
 /// is logged in release builds.
 async fn compress_response(req_headers: &HeaderMap<header::HeaderValue>, res: &mut Response<Body>) -> Result<(), String> {
-	// Check if the data is eligible for compression.
-	if let Some(hdr) = res.headers().get(header::CONTENT_TYPE) {
-		match from_utf8(hdr.as_bytes()) {
-			Ok(val) => {
-				let s = val.to_string();
-
-				// TODO: better determination of what is eligible for compression
-				if !(s.starts_with("text/") || s.starts_with("application/json")) {
-					return Ok(());
-				};
-			}
-			Err(e) => {
-				dbg_msg!(e);
-				return Err(e.to_string());
-			}
-		};
-	} else {
-		// Response declares no Content-Type. Assume for simplicity that it
-		// cannot be compressed.
+	// Images and media are already compressed and may be very large. Draining a
+	// proxied video/GIF into memory here defeats streaming and can exhaust a
+	// small host. Only buffer response types that benefit from HTTP compression.
+	if !response_is_compressible(res) {
 		return Ok(());
-	};
+	}
 
 	// Don't bother if the size of the size of the response body will fit
 	// within an IP frame (less the bytes that make up the TCP/IP and HTTP
@@ -653,6 +657,7 @@ async fn compress_response(req_headers: &HeaderMap<header::HeaderValue>, res: &m
 		Some(c) => c,
 		None => return Ok(()),
 	};
+	let _compression_permit = COMPRESSION_LIMIT.acquire().await.map_err(|_| "Compression limiter closed".to_owned())?;
 
 	// Get the body from the response.
 	let body_bytes: Vec<u8> = match body::to_bytes(res.body_mut()).await {
@@ -687,17 +692,20 @@ async fn compress_response(req_headers: &HeaderMap<header::HeaderValue>, res: &m
 	Ok(())
 }
 
+fn response_is_compressible(res: &Response<Body>) -> bool {
+	let Some(content_type) = res.headers().get(header::CONTENT_TYPE).and_then(|value| value.to_str().ok()) else {
+		return false;
+	};
+	let content_type = content_type.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+
+	content_type.starts_with("text/") || content_type == "application/json"
+}
+
 /// Compresses a `Vec<u8>` given a [`CompressionType`].
 ///
 /// This is a helper function for [`compress_response`] and should not be
 /// called directly.
 
-// I've chosen a TTL of 600 (== 10 minutes) since compression is
-// computationally expensive and we don't want to be doing it often. This is
-// larger than client::json's TTL, but that's okay, because if client::json
-// returns a new serde_json::Value, body_bytes changes, so this function will
-// execute again.
-#[cached(size = 100, time = 600, result = true)]
 fn compress_body(compressor: CompressionType, body_bytes: Vec<u8>) -> Result<Vec<u8>, String> {
 	// io::Cursor implements io::Read, required for our encoders.
 	let mut reader = io::Cursor::new(body_bytes);
@@ -864,5 +872,21 @@ mod tests {
 
 			assert!(decompressed.eq(&expected_lorem_ipsum));
 		}
+	}
+
+	#[tokio::test]
+	async fn media_responses_are_not_buffered_or_compressed() {
+		let mut req_headers = HeaderMap::new();
+		req_headers.insert(header::ACCEPT_ENCODING, header::HeaderValue::from_static("gzip, br"));
+		let mut res = Response::builder()
+			.status(200)
+			.header(header::CONTENT_TYPE, "image/gif")
+			.body(Body::from(vec![0_u8; 4096]))
+			.unwrap();
+
+		compress_response(&req_headers, &mut res).await.unwrap();
+
+		assert!(res.headers().get(header::CONTENT_ENCODING).is_none());
+		assert_eq!(body::to_bytes(res.body_mut()).await.unwrap().len(), 4096);
 	}
 }

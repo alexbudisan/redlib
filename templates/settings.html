@@ -98,39 +98,6 @@
 					<input type="checkbox" name="autoplay_videos" id="autoplay_videos" {% if prefs.autoplay_videos=="on"
 						%}checked{% endif %}>
 				</div>
-				<div class="prefs-group prefs-group-help">
-					<label for="embed_comment_gifs">Embed supported GIF links in comments</label>
-					<input type="hidden" value="off" name="embed_comment_gifs">
-					<input type="checkbox" name="embed_comment_gifs" id="embed_comment_gifs" {% if
-						prefs.embed_comment_gifs=="on" %}checked{% endif %}>
-					<details id="comment_gif_help">
-						<summary>Limits and privacy</summary>
-						<div class="helper">Default off. Supports Giphy, direct Imgur GIF links, and Reddit-hosted GIF links; uses muted MP4 previews
-							where available,
-							rejects individual media over 8 MB, and observes the limits configured below. Embedded media is proxied through this
-							instance; tapping a preview visits its original source.</div>
-					</details>
-				</div>
-				<div class="prefs-group">
-					<label for="comment_gif_limit">Maximum GIF previews per page:</label>
-					<input type="number" name="comment_gif_limit" id="comment_gif_limit" value="{{ prefs.comment_gif_limit }}" min="0" max="50" step="1">
-				</div>
-				<div class="prefs-group">
-					<label for="comment_gif_total_mb">Maximum total GIF size per page (MB):</label>
-					<input type="number" name="comment_gif_total_mb" id="comment_gif_total_mb" value="{{ prefs.comment_gif_total_mb }}" min="1" max="100" step="1">
-				</div>
-				<div class="prefs-group prefs-group-help">
-					<label for="disable_gifs_on_metered">Disable comment GIF previews on reported cellular or data-saver connections</label>
-					<input type="hidden" value="off" name="disable_gifs_on_metered">
-					<input type="checkbox" name="disable_gifs_on_metered" id="disable_gifs_on_metered" {% if
-						prefs.disable_gifs_on_metered=="on" %}checked{% endif %}>
-					<details id="comment_gif_network_help">
-						<summary>Browser support</summary>
-						<div class="helper">Enabled by default. Chromium-based browsers can report metered connections.
-							Safari on iPhone and iPad does not expose whether the device is using cellular data, so this
-							cannot be detected there.</div>
-					</details>
-				</div>
 				<div class="prefs-group">
 					<label for="fixed_navbar">Keep navbar fixed</label>
 					<input type="hidden" value="off" name="fixed_navbar">
