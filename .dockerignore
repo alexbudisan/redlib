@@ -5,3 +5,4 @@ Dockerfile*
 *.tar
 *.tar.gz
 *.tgz
+dist

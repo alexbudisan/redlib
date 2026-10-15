@@ -8,3 +8,6 @@ redlib.toml
 # nix files
 .direnv/
 result
+
+# Build output from scripts/build-arm64.sh
+/dist
