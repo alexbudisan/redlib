@@ -145,8 +145,9 @@
 	{% for image in post.gallery -%}
 		<figure>
 			{% if image.is_video %}
-			<video class="gallery_animation" width="{{ image.width }}" height="{{ image.height }}" muted autoplay loop playsinline controls preload="metadata">
-				<source src="{{ image.url }}" type="video/mp4">
+			<video class="gallery_animation" width="{{ image.width }}" height="{{ image.height }}" {% if !image.poster.is_empty() %}poster="{{ image.poster }}" {% endif %}muted loop playsinline controls preload="metadata">
+				<!-- #t=0.001 makes Safari draw the first frame when there's no poster -->
+				<source src="{{ image.url }}#t=0.001" type="video/mp4">
 				<a href="{{ image.fallback_url }}">Open animated media</a>
 			</video>
 			{% else %}

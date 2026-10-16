@@ -292,6 +292,8 @@ pub struct GalleryMedia {
 	pub url: String,
 	pub fallback_url: String,
 	pub is_video: bool,
+	/// Still preview shown before an animated item is played.
+	pub poster: String,
 	pub width: i64,
 	pub height: i64,
 	pub caption: String,
@@ -326,11 +328,24 @@ impl GalleryMedia {
 					(ordinary_url, ordinary_url, false)
 				};
 
+				// Reddit lists still previews smallest first; use the largest.
+				let poster = if is_video {
+					metadata[media_id]["p"]
+						.as_array()
+						.and_then(|previews| previews.last())
+						.and_then(|preview| preview["u"].as_str())
+						.map(format_url)
+						.unwrap_or_default()
+				} else {
+					String::new()
+				};
+
 				// Construct gallery items
 				Self {
 					url: format_url(url),
 					fallback_url: format_url(fallback_url),
 					is_video,
+					poster,
 					width: image["x"].as_i64().unwrap_or_default(),
 					height: image["y"].as_i64().unwrap_or_default(),
 					caption: item["caption"].as_str().unwrap_or_default().to_string(),
@@ -1482,6 +1497,10 @@ mod tests {
 		let metadata = serde_json::json!({
 			"animated": {
 				"m": "image/gif",
+				"p": [
+					{ "u": "https://preview.redd.it/animated.png?width=108", "x": 108, "y": 81 },
+					{ "u": "https://preview.redd.it/animated.png?width=640", "x": 640, "y": 480 }
+				],
 				"s": {
 					"mp4": "https://preview.redd.it/animated.mp4?x=1",
 					"gif": "https://preview.redd.it/animated.gif?x=1",
@@ -1504,8 +1523,10 @@ mod tests {
 		assert_eq!(gallery[0].url, "/preview/pre/animated.mp4?x=1");
 		assert_eq!(gallery[0].fallback_url, "/preview/pre/animated.gif?x=1");
 		assert!(gallery[0].is_video);
+		assert_eq!(gallery[0].poster, "/preview/pre/animated.png?width=640");
 		assert_eq!(gallery[1].url, "/img/fallback.gif");
 		assert!(!gallery[1].is_video);
+		assert!(gallery[1].poster.is_empty());
 	}
 
 	#[test]

@@ -1205,6 +1205,14 @@ a.search_subreddit:hover {
     margin: 0 auto;
 }
 
+/* Drop the browser's default 40px side margins on figures so gallery and
+   self-text images line up with the text instead of sitting inset. */
+.gallery figure,
+.post_body figure {
+    margin-left: 0;
+    margin-right: 0;
+}
+
 .gallery_media_fallback {
     color: var(--accent);
     font-size: 12px;
