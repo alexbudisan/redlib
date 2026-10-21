@@ -418,8 +418,9 @@ async fn fetch_json(path: String, quarantine: bool) -> Result<Value, String> {
 	let current_rate_limit = OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst);
 	let _ = OAUTH_RATELIMIT_REMAINING.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| Some(remaining.saturating_sub(1)));
 
-	// Fetch the url...
-	match reddit_get(path.clone(), quarantine).await {
+	// Fetch the url. Thread routes need the slash between the subreddit and
+	// `comments` encoded; see encode_thread_route().
+	match reddit_get(encode_thread_route(&path), quarantine).await {
 		Ok(response) => {
 			let status = response.status();
 
@@ -516,11 +517,7 @@ async fn fetch_json(path: String, quarantine: bool) -> Result<Value, String> {
 						}
 						Err(e) => {
 							error!("Got an invalid response from reddit {e}. Status code: {status}");
-							if status.is_server_error() {
-								Err("Reddit is having issues, check if there's an outage".to_string())
-							} else {
-								err("Failed to parse page JSON data", e.to_string(), path)
-							}
+							Err(non_json_response_error(status.as_u16(), &e.to_string(), &path))
 						}
 					}
 				}
@@ -528,6 +525,55 @@ async fn fetch_json(path: String, quarantine: bool) -> Result<Value, String> {
 			}
 		}
 		Err(e) => err("Couldn't send request to Reddit", e, path),
+	}
+}
+
+/// Percent-encodes the slash that joins the subreddit to `comments` in a
+/// thread route.
+///
+/// Since 2026-10-20 Reddit's edge matches the literal path
+/// `/r/<subreddit>/comments/...` and answers it with an HTML "You've been
+/// blocked by network security" page for anonymous OAuth tokens, which is
+/// every token Redlib can mint. The same request with that one slash encoded
+/// is not matched and returns the usual JSON. Remove this if Reddit starts
+/// normalising the path. See https://github.com/redlib-org/redlib/issues/591
+/// and https://github.com/redlib-org/redlib/pull/592.
+///
+/// `/r/rust/comments/18t5968/foo/.json?raw_json=1`
+///   -> `/r/rust%2fcomments/18t5968/foo/.json?raw_json=1`
+fn encode_thread_route(path: &str) -> String {
+	let (path_part, query_part) = match path.split_once('?') {
+		Some((path_part, query_part)) => (path_part, Some(query_part)),
+		None => (path, None),
+	};
+
+	let mut encoded_path = path_part.to_string();
+	if let Some(rest) = path_part.strip_prefix("/r/") {
+		if let Some(index) = rest.find("/comments") {
+			let tail = &rest[index + "/comments".len()..];
+			// `/comments/`, `/comments.json` or a trailing `/comments` is the
+			// route; `/commentsXYZ` is not.
+			if tail.is_empty() || tail.starts_with('/') || tail.starts_with('.') {
+				encoded_path = format!("/r/{}%2fcomments{tail}", &rest[..index]);
+			}
+		}
+	}
+
+	match query_part {
+		Some(query_part) => format!("{encoded_path}?{query_part}"),
+		None => encoded_path,
+	}
+}
+
+/// Name the real cause when Reddit answers with something other than JSON,
+/// instead of reporting a JSON parse error.
+fn non_json_response_error(status: u16, parse_error: &str, path: &str) -> String {
+	if status == 403 {
+		format!("Reddit blocked this request (403 Forbidden) | {path}")
+	} else if (500..=599).contains(&status) {
+		"Reddit is having issues, check if there's an outage".to_string()
+	} else {
+		format!("Failed to parse page JSON data: {parse_error} | {path}")
 	}
 }
 
@@ -596,6 +642,39 @@ mod tests {
 	use {crate::config::get_setting, sealed_test::prelude::*};
 
 	const POPULAR_URL: &str = "/r/popular/hot.json?&raw_json=1&geo_filter=GLOBAL";
+
+	#[test]
+	fn thread_routes_get_their_slash_encoded() {
+		assert_eq!(
+			encode_thread_route("/r/politics/comments/1x9xx9e/.json?&sort=confidence&raw_json=1"),
+			"/r/politics%2fcomments/1x9xx9e/.json?&sort=confidence&raw_json=1"
+		);
+		assert_eq!(
+			encode_thread_route("/r/rust/comments/18t5968/kfbqlbc/.json?raw_json=1"),
+			"/r/rust%2fcomments/18t5968/kfbqlbc/.json?raw_json=1"
+		);
+		assert_eq!(encode_thread_route("/r/comments/comments/1x9xx9e/.json"), "/r/comments%2fcomments/1x9xx9e/.json");
+	}
+
+	#[test]
+	fn non_thread_paths_are_left_alone() {
+		for path in [
+			"/r/popular/hot.json?&raw_json=1&geo_filter=GLOBAL",
+			"/r/rust/about.json?raw_json=1",
+			"/r/rust/commentsXYZ.json",
+			"/user/spez/comments.json?limit=1",
+			"/comments/1x9xx9e",
+		] {
+			assert_eq!(encode_thread_route(path), path, "{path}");
+		}
+	}
+
+	#[test]
+	fn blocked_response_reports_the_block() {
+		let msg = non_json_response_error(403, "expected value at line 1 column 1", "/r/x/comments/1/.json");
+		assert!(msg.contains("403") && !msg.contains("Failed to parse"), "{msg}");
+		assert_eq!(non_json_response_error(502, "e", "/r/x"), "Reddit is having issues, check if there's an outage");
+	}
 
 	#[test]
 	fn classifies_cache_lifetimes_by_endpoint() {
