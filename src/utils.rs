@@ -1152,7 +1152,7 @@ pub fn render_bullet_lists(input_text: &str) -> String {
 // These are links we want to replace in-body
 static REDDIT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"href="(https|http|)://(www\.|old\.|np\.|amp\.|new\.|)(reddit\.com|redd\.it)/"#).unwrap());
 static REDDIT_PREVIEW_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://(external-preview|preview|i)\.redd\.it(.*)").unwrap());
-static REDDIT_EMOJI_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://(www|).redditstatic\.com/(.*)").unwrap());
+static REDDIT_EMOJI_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://(?:www\.)?redditstatic\.com/[^\s"'<>]*"#).unwrap());
 static REDLIB_PREVIEW_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/(img|preview/)(pre|external-pre)?/(.*?)>"#).unwrap());
 static REDLIB_PREVIEW_TEXT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r">(.*?)</a>").unwrap());
 /// Rewrite Reddit links to Redlib in body of text
@@ -1161,15 +1161,10 @@ pub fn rewrite_urls(input_text: &str) -> String {
 		// Rewrite Reddit links to Redlib
 		REDDIT_REGEX.replace_all(input_text, r#"href="/"#).to_string();
 
-	loop {
-		if REDDIT_EMOJI_REGEX.find(&text1).is_none() {
-			break;
-		} else {
-			text1 = REDDIT_EMOJI_REGEX
-				.replace_all(&text1, format_url(REDDIT_EMOJI_REGEX.find(&text1).map(|x| x.as_str()).unwrap_or_default()))
-				.to_string()
-		}
-	}
+	// Rewrite each redditstatic URL on its own. This used to loop until no
+	// match remained, which never ended when format_url left a URL unchanged
+	// (e.g. "xredditstatic.com"), pinning a worker thread at 100% CPU.
+	text1 = REDDIT_EMOJI_REGEX.replace_all(&text1, |caps: &regex::Captures<'_>| format_url(&caps[0])).to_string();
 
 	// Remove (html-encoded) "\" from URLs.
 	text1 = text1.replace("%5C", "").replace("\\_", "_");
@@ -1527,6 +1522,18 @@ mod tests {
 		assert_eq!(gallery[1].url, "/img/fallback.gif");
 		assert!(!gallery[1].is_video);
 		assert!(gallery[1].poster.is_empty());
+	}
+
+	#[test]
+	fn rewrite_urls_handles_each_redditstatic_link_and_terminates() {
+		let input = "<p>a <a href=\"https://www.redditstatic.com/one.png\">one</a> tail-A</p>\n<p>b <a href=\"https://www.redditstatic.com/two.png\">two</a> tail-B</p>";
+		let output = rewrite_urls(input);
+		assert!(output.contains(r#"href="/static/one.png">one</a> tail-A"#), "{output}");
+		assert!(output.contains(r#"href="/static/two.png">two</a> tail-B"#), "{output}");
+
+		// Used to loop forever because the unescaped "." matched this host.
+		let typo = "<p>typo link https://xredditstatic.com/foo here</p>";
+		assert_eq!(rewrite_urls(typo), typo);
 	}
 
 	#[test]
