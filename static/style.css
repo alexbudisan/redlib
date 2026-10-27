@@ -1564,6 +1564,12 @@ a.search_subreddit:hover {
     margin: 2px 0 4px 15px;
 }
 
+.more_comments {
+    display: block;
+    color: var(--accent);
+    margin: 10px 0 20px 15px;
+}
+
 .continue_thread {
     display: block;
     color: var(--accent);

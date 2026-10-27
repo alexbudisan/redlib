@@ -20,6 +20,7 @@ struct PostTemplate {
 	single_thread: bool,
 	url_without_query: String,
 	comment_query: String,
+	next_cursor: String,
 }
 
 #[derive(Template)]
@@ -57,8 +58,15 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 	let single_thread = req.param("comment_id").is_some();
 	let highlighted_comment = &req.param("comment_id").unwrap_or_default();
 
-	// Send a request to the url, receive JSON in response
-	match json(path, quarantined).await {
+	// Reddit blocks the comments JSON endpoint for anonymous sign-ins, so load
+	// threads through the Android app's GraphQL operation. A registered script
+	// app can still read the JSON endpoint and can't use that operation.
+	let thread = if crate::client::OAUTH_CLIENT.load().is_script_app() {
+		json(path, quarantined).await
+	} else {
+		crate::gql::thread(path, quarantined).await
+	};
+	match thread {
 		// Otherwise, grab the JSON output from the request
 		Ok(response) => {
 			// Parse the JSON into Post and Comment structs
@@ -106,7 +114,8 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 				comments,
 				post,
 				url_without_query,
-				sort,
+				sort: response[1]["data"]["sort"].as_str().unwrap_or(&sort).to_string(),
+				next_cursor: response[1]["data"]["after"].as_str().unwrap_or_default().to_string(),
 				prefs: Preferences::new(&req),
 				single_thread,
 				comment_query: query,
