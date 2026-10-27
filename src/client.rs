@@ -420,7 +420,10 @@ async fn fetch_json(path: String, quarantine: bool) -> Result<Value, String> {
 
 	// Fetch the url. Thread routes need the slash between the subreddit and
 	// `comments` encoded; see encode_thread_route().
-	match reddit_get(encode_thread_route(&path), quarantine).await {
+	// Only needed for the anonymous sign-in; a registered script app may read
+	// thread pages normally.
+	let request_path = if OAUTH_CLIENT.load().is_script_app() { path.clone() } else { encode_thread_route(&path) };
+	match reddit_get(request_path, quarantine).await {
 		Ok(response) => {
 			let status = response.status();
 

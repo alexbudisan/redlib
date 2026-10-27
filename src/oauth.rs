@@ -38,6 +38,7 @@ trait OauthBackend: Send + Sync {
 pub(crate) enum OauthBackendImpl {
 	MobileSpoof(MobileSpoofAuth),
 	GenericWeb(GenericWebAuth),
+	Script(ScriptAuth),
 }
 
 impl OauthBackend for OauthBackendImpl {
@@ -45,6 +46,7 @@ impl OauthBackend for OauthBackendImpl {
 		match self {
 			OauthBackendImpl::MobileSpoof(backend) => backend.authenticate().await,
 			OauthBackendImpl::GenericWeb(backend) => backend.authenticate().await,
+			OauthBackendImpl::Script(backend) => backend.authenticate().await,
 		}
 	}
 
@@ -52,6 +54,7 @@ impl OauthBackend for OauthBackendImpl {
 		match self {
 			OauthBackendImpl::MobileSpoof(backend) => backend.user_agent(),
 			OauthBackendImpl::GenericWeb(backend) => backend.user_agent(),
+			OauthBackendImpl::Script(backend) => backend.user_agent(),
 		}
 	}
 
@@ -59,6 +62,7 @@ impl OauthBackend for OauthBackendImpl {
 		match self {
 			OauthBackendImpl::MobileSpoof(backend) => backend.get_headers(),
 			OauthBackendImpl::GenericWeb(backend) => backend.get_headers(),
+			OauthBackendImpl::Script(backend) => backend.get_headers(),
 		}
 	}
 }
@@ -89,7 +93,14 @@ impl Oauth {
 		// turning an outage into a restart/request storm.
 		let mut failure_count = 0_u32;
 		let mut backend_failure_count = 0_u32;
-		let mut backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new());
+		// A configured script app is the only backend used; never fall back to
+		// impersonating Reddit's own apps with the owner's account configured.
+		let script = ScriptAuth::from_env();
+		let uses_script = script.is_some();
+		let mut backend = match script {
+			Some(script) => OauthBackendImpl::Script(script),
+			None => OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new()),
+		};
 
 		loop {
 			let attempt = Self::new_with_timeout_with_backend(backend.clone()).await;
@@ -111,7 +122,7 @@ impl Oauth {
 
 			// Occasionally try the alternative backend, without rapidly hitting both
 			// OAuth endpoints during a general connectivity outage.
-			if backend_failure_count >= OAUTH_ATTEMPTS_PER_BACKEND {
+			if !uses_script && backend_failure_count >= OAUTH_ATTEMPTS_PER_BACKEND {
 				backend = match backend {
 					OauthBackendImpl::MobileSpoof(_) => {
 						warn!("[🔄] Mobile OAuth failed {backend_failure_count} times; trying GenericWeb OAuth next");
@@ -121,6 +132,7 @@ impl Oauth {
 						warn!("[🔄] GenericWeb OAuth failed {backend_failure_count} times; trying mobile OAuth next");
 						OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new())
 					}
+					OauthBackendImpl::Script(_) => unreachable!("script backend never rotates"),
 				};
 				backend_failure_count = 0;
 			}
@@ -151,6 +163,11 @@ impl Oauth {
 
 	pub fn user_agent(&self) -> &str {
 		self.backend.user_agent()
+	}
+
+	/// True when signed in as the owner's own registered Reddit app.
+	pub fn is_script_app(&self) -> bool {
+		matches!(self.backend, OauthBackendImpl::Script(_))
 	}
 }
 
@@ -500,6 +517,119 @@ impl OauthBackend for GenericWebAuth {
 	}
 }
 
+// ScriptAuth backend - the owner's own "script" app registered at
+// https://www.reddit.com/prefs/apps. It signs in with a long-lived refresh
+// token from a one-time browser approval (scripts/reddit-refresh-token.sh),
+// so no Reddit password is stored and Google sign-in or two-factor accounts
+// work. Reddit asks API clients to send a unique, descriptive User-Agent
+// naming the app and its owner.
+#[derive(Clone)]
+pub struct ScriptAuth {
+	client_id: String,
+	client_secret: String,
+	refresh_token: String,
+	username: String,
+	user_agent: String,
+}
+
+// Never print the secret or refresh token, even in debug logs.
+impl std::fmt::Debug for ScriptAuth {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("ScriptAuth").field("username", &self.username).finish_non_exhaustive()
+	}
+}
+
+impl ScriptAuth {
+	/// Read REDLIB_REDDIT_{CLIENT_ID,CLIENT_SECRET,REFRESH_TOKEN,USERNAME}. All
+	/// four must be non-empty; otherwise Redlib keeps its anonymous sign-in.
+	pub(crate) fn from_env() -> Option<Self> {
+		Self::from_values(
+			std::env::var("REDLIB_REDDIT_CLIENT_ID").ok(),
+			std::env::var("REDLIB_REDDIT_CLIENT_SECRET").ok(),
+			std::env::var("REDLIB_REDDIT_REFRESH_TOKEN").ok(),
+			std::env::var("REDLIB_REDDIT_USERNAME").ok(),
+		)
+	}
+
+	fn from_values(client_id: Option<String>, client_secret: Option<String>, refresh_token: Option<String>, username: Option<String>) -> Option<Self> {
+		let non_empty = |value: Option<String>| value.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty());
+		let values = [non_empty(client_id), non_empty(client_secret), non_empty(refresh_token), non_empty(username)];
+		let set = values.iter().filter(|value| value.is_some()).count();
+		if set != 4 {
+			if set > 0 {
+				warn!("[⚠️] Only {set} of the 4 REDLIB_REDDIT_* settings are set; using anonymous sign-in");
+			}
+			return None;
+		}
+		let [Some(client_id), Some(client_secret), Some(refresh_token), Some(username)] = values else {
+			return None;
+		};
+		let username = username.trim_start_matches("/u/").trim_start_matches("u/").to_owned();
+		let user_agent = format!("linux:redlib-personal:v{} (by /u/{username})", env!("CARGO_PKG_VERSION"));
+		Some(Self {
+			client_id,
+			client_secret,
+			refresh_token,
+			username,
+			user_agent,
+		})
+	}
+}
+
+impl OauthBackend for ScriptAuth {
+	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
+		let url = "https://www.reddit.com/api/v1/access_token";
+		let auth = general_purpose::STANDARD.encode(format!("{}:{}", self.client_id, self.client_secret));
+		let body = serde_urlencoded::to_string([("grant_type", "refresh_token"), ("refresh_token", self.refresh_token.as_str())])
+			.map_err(|_| AuthError::Field("Could not encode the sign-in request"))?;
+
+		trace!("Sending script app token request for /u/{}...", self.username);
+		let resp = CLIENT
+			.post(url)
+			.header("User-Agent", &self.user_agent)
+			.header("Authorization", format!("Basic {auth}"))
+			.header("Content-Type", "application/x-www-form-urlencoded")
+			.body(body)
+			.send()
+			.await?;
+		let status = resp.status();
+		let json: serde_json::Value = resp.json().await?;
+
+		if let Some(error) = json.get("error") {
+			// Reddit answers a revoked or mistyped refresh token with
+			// {"error": "invalid_grant"} and a wrong client id/secret with 401.
+			// Say which, without echoing secrets.
+			error!("[⛔] Reddit rejected the script app sign-in ({status}): {error}. Check the REDLIB_REDDIT_* settings, or create a new refresh token with scripts/reddit-refresh-token.sh");
+			return Err(AuthError::Field("Reddit rejected the script app credentials"));
+		}
+
+		let token = json
+			.get("access_token")
+			.and_then(serde_json::Value::as_str)
+			.ok_or(AuthError::Field("OAuth response is missing access_token"))?
+			.to_string();
+		let expires_in = json
+			.get("expires_in")
+			.and_then(serde_json::Value::as_u64)
+			.ok_or(AuthError::Field("OAuth response is missing expires_in"))?;
+
+		info!("[✅] Signed in as script app for /u/{}; token expires in {expires_in}s", self.username);
+		Ok(OauthResponse {
+			token,
+			expires_in,
+			additional_headers: HashMap::new(),
+		})
+	}
+
+	fn user_agent(&self) -> &str {
+		&self.user_agent
+	}
+
+	fn get_headers(&self) -> HashMap<String, String> {
+		HashMap::from([("User-Agent".to_owned(), self.user_agent.clone())])
+	}
+}
+
 impl Device {
 	fn android() -> Self {
 		// Generate uuid
@@ -614,6 +744,21 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_oauth_headers_len() {
 		assert!(OAUTH_CLIENT.load_full().headers_map.len() >= 3);
+	}
+
+	#[test]
+	fn script_auth_needs_all_four_settings() {
+		let some = |value: &str| Some(value.to_owned());
+		assert!(ScriptAuth::from_values(some("id"), some("secret"), None, some("me")).is_none());
+		assert!(ScriptAuth::from_values(some("id"), some(" "), some("token"), some("me")).is_none());
+		assert!(ScriptAuth::from_values(None, None, None, None).is_none());
+
+		let script = ScriptAuth::from_values(some("id"), some("secret"), some("token"), some("u/me")).expect("all four set");
+		assert!(script.user_agent().starts_with("linux:redlib-personal:v"));
+		assert!(script.user_agent().ends_with("(by /u/me)"));
+		assert_eq!(script.get_headers().get("User-Agent").map(String::as_str), Some(script.user_agent()));
+		let debug = format!("{script:?}");
+		assert!(!debug.contains("secret") && !debug.contains("token"), "{debug}");
 	}
 
 	#[test]

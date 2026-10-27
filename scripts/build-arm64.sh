@@ -31,6 +31,13 @@ services:
       - MALLOC_ARENA_MAX=2
       - RUST_LOG=redlib=info,warn
       - RUST_BACKTRACE=1
+      # Your Reddit "script" app (reddit.com/prefs/apps). Set the values in
+      # Portainer's "Environment variables" section for the stack; leave them
+      # unset to keep Redlib's anonymous sign-in.
+      - REDLIB_REDDIT_CLIENT_ID=\${REDLIB_REDDIT_CLIENT_ID:-}
+      - REDLIB_REDDIT_CLIENT_SECRET=\${REDLIB_REDDIT_CLIENT_SECRET:-}
+      - REDLIB_REDDIT_REFRESH_TOKEN=\${REDLIB_REDDIT_REFRESH_TOKEN:-}
+      - REDLIB_REDDIT_USERNAME=\${REDLIB_REDDIT_USERNAME:-}
     ports:
       - "8666:8080"
     mem_limit: 512m
